@@ -1,0 +1,79 @@
+diff --git c/osfmk/arm64/arm_vm_init.c w/osfmk/arm64/arm_vm_init.c
+index 4b74d46..dc0398f 100644
+--- c/osfmk/arm64/arm_vm_init.c
++++ w/osfmk/arm64/arm_vm_init.c
+@@ -1851,7 +1851,7 @@ sweet_early_map_final(void)
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
+ 	for (unsigned int i = 0; i < SWEET_EARLY_FB_BLOCKS; i++) {
+ 		assert(slot[i] == ARM_TTE_EMPTY);
+-		slot[i] = (0x9c000000ULL + (uint64_t)i * ARM_TT_L2_SIZE) | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++		slot[i] = ((uint64_t)SWEET_FB_PHYS + (uint64_t)i * ARM_TT_L2_SIZE) | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+ 		    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
+ 		    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
+ 		    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
+diff --git c/osfmk/arm64/start.s w/osfmk/arm64/start.s
+index 80c19c9..280693e 100644
+--- c/osfmk/arm64/start.s
++++ w/osfmk/arm64/start.s
+@@ -515,10 +515,10 @@ LEXT(start_first_cpu)
+ 
+ #if defined(SWEET)
+ 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
+-	MOV64	x0, (0x9c000000 + 2368 * 4320)
++	MOV64	x0, (SWEET_FB_PHYS + (SWEET_FB_H - 32) * SWEET_FB_STRIDE)
+ 	mov		w1, #-1
+ 	mov		x2, #32
+-	mov		x4, #4320
++	mov		x4, #SWEET_FB_STRIDE
+ Lsweet_mark_row:
+ 	mov		x3, #64
+ 	mov		x5, x0
+@@ -686,7 +686,7 @@ Lkernelcache_base_found:
+ 	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
+ 	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
+ 	 */
+-	MOV64	x10, 0x9c000000
++	MOV64	x10, SWEET_FB_PHYS
+ 	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+diff --git c/osfmk/arm64/sweet_early.c w/osfmk/arm64/sweet_early.c
+index 6928957..e1021e0 100644
+--- c/osfmk/arm64/sweet_early.c
++++ w/osfmk/arm64/sweet_early.c
+@@ -10,12 +10,13 @@
+ #if defined(SWEET)
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
++#include <pexpert/arm64/board_config.h>
+ 
+-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
++static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)SWEET_FB_PHYS;
+ #define EARLY_FB early_fb
+-#define EARLY_WIDTH 1080u
+-#define EARLY_HEIGHT 2400u
+-#define EARLY_STRIDE (4320u / 4)
++#define EARLY_WIDTH SWEET_FB_W
++#define EARLY_HEIGHT SWEET_FB_H
++#define EARLY_STRIDE (SWEET_FB_STRIDE / 4)
+ #define EARLY_SCALE 2u
+ #define EARLY_CELL_W (8u * EARLY_SCALE)
+ #define EARLY_CELL_H (16u * EARLY_SCALE)
+diff --git c/pexpert/pexpert/arm64/SWEET.h w/pexpert/pexpert/arm64/SWEET.h
+index b4d3687..877c378 100644
+--- c/pexpert/pexpert/arm64/SWEET.h
++++ w/pexpert/pexpert/arm64/SWEET.h
+@@ -52,7 +52,12 @@
+ #define SWEET_GICC_EOIR           0x010
+ 
+ /* shamrock: 4K pages -> 2MB L2 blocks; the early framebuffer needs several (QEMU 1080x2400x4 = 10.4MB -> 6) */
+-#define SWEET_EARLY_FB_BLOCKS     6
++#define SWEET_EARLY_FB_BLOCKS     4
++/* shamrock: the 32bpp scanout buffer the shim points MDP5 at (1080*1920*4 = 0x7e9000, 4 x 2MB blocks) */
++#define SWEET_FB_PHYS             0x90000000
++#define SWEET_FB_W                1080
++#define SWEET_FB_H                1920
++#define SWEET_FB_STRIDE           4320
+ 
+ #ifndef ASSEMBLER
+ #define PLATFORM_PANIC_LOG_DISABLED
