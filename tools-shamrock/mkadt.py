@@ -154,11 +154,13 @@ def build(seed=None, qemu=False, highmem=False):
     cpu_nodes = []
     # shamrock: 2 clusters x 4 Cortex-A53; the boot CPU is MPIDR 0x100 (measured by S0), so it comes first.
     mpidrs = [0x100, 0x101, 0x102, 0x103, 0x000, 0x001, 0x002, 0x003] if SHAMROCK else [c << 8 for c in range(8)]
-    for core in range(1 if qemu else 8):
+    if qemu and '--cpus8' in sys.argv:
+        mpidrs = list(range(8))   # QEMU virt MPIDRs; only cpu0 is really there with -smp 1
+    for core in range(1 if (qemu and '--cpus8' not in sys.argv) else 8):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', (cstr('ARM,cortex-a53') if SHAMROCK else cstr('qcom,kryo470')) + cstr('ARM,v8')),
+            ('compatible', cstr('qcom,kryo470') + cstr('ARM,v8')),   # SweetCPU matches on this name (also shamrock; cluster is A53)
             ('reg', u32(mpidrs[core])),  # actual MPIDR Aff1:Aff0, NOT logical ID
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
