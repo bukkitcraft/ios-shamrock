@@ -1,0 +1,14 @@
+diff --git c/osfmk/mach/arm/vm_param.h w/osfmk/mach/arm/vm_param.h
+index c013288..a8f0d08 100644
+--- c/osfmk/mach/arm/vm_param.h
++++ w/osfmk/mach/arm/vm_param.h
+@@ -133,7 +133,8 @@ extern int PAGE_SHIFT_CONST;
+ 
+ /* system-wide values */
+ #define MACH_VM_MIN_ADDRESS_RAW 0x0ULL
+-#if defined(XNU_PLATFORM_MacOSX) || defined(XNU_PLATFORM_DriverKit)
++/* shamrock: 4K pages (L1 = 1GB) cannot span the 47-bit macOS user VA; use the iOS limit below the commpage */
++#if (defined(XNU_PLATFORM_MacOSX) || defined(XNU_PLATFORM_DriverKit)) && defined(__ARM_16K_PG__)
+ #define MACH_VM_MAX_ADDRESS_RAW 0x00007FFFFE000000ULL
+ #else
+ #define MACH_VM_MAX_ADDRESS_RAW 0x0000000FC0000000ULL
