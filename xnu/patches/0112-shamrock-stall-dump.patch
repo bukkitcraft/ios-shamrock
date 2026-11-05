@@ -1,0 +1,191 @@
+diff --git c/iokit/Kernel/arm/SweetPlatformExpert.cpp w/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 0631685..3a5165b 100644
+--- c/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ w/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -10,6 +10,8 @@
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
+ 
++extern "C" void sweet_stall_arm(uint32_t seconds);
++
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+ 
+@@ -31,6 +33,14 @@ SweetPlatformExpert::start(IOService *provider)
+ 	}
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
++	{
++		/* shamrock: boot-arg sweetstall=<seconds> dumps all thread states to RAM and resets via the watchdog */
++		uint32_t stall = 0;
++		(void)PE_parse_boot_argn("sweetstall", &stall, sizeof(stall));
++		if (stall) {
++			sweet_stall_arm(stall);
++		}
++	}
+ 	return true;
+ }
+ 
+diff --git c/osfmk/arm64/sweet_stall.c w/osfmk/arm64/sweet_stall.c
+new file mode 100644
+index 0000000..e972736
+--- /dev/null
++++ w/osfmk/arm64/sweet_stall.c
+@@ -0,0 +1,145 @@
++/*
++ * shamrock stall dump: N seconds after the platform expert starts, write the state of every kernel
++ * thread (state, wait event, continuation, frame-pointer backtrace) into a RAM buffer that xnu does
++ * not manage (0xbff40000), then reset the SoC with the APSS watchdog. DRAM survives the reset
++ * (verified), lk2nd comes back and the buffer is read with `fastboot oem debug readl`.
++ * Format: "SWEETDUMP" header then text. Symbolize the hex addresses on the host with llvm-nm.
++ */
++#include <mach/mach_types.h>
++#include <kern/kern_types.h>
++#include <kern/thread.h>
++#include <kern/processor.h>
++#include <kern/thread_call.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/sched_prim.h>
++#include <arm/machine_routines.h>
++#include <arm64/proc_reg.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++#define STALL_PA   0xbff40000ULL
++#define STALL_SIZE 0x40000
++#define STALL_WDT  0x0b017000ULL
++
++static char *sbuf;
++static uint32_t spos;
++
++static void
++s_c(char c)
++{
++	if (spos < STALL_SIZE - 32) {
++		sbuf[16 + spos++] = c;
++	}
++}
++
++static void
++s_s(const char *p)
++{
++	while (*p) {
++		s_c(*p++);
++	}
++}
++
++static void
++s_x(uint64_t v)
++{
++	for (int i = 60; i >= 0; i -= 4) {
++		s_c("0123456789abcdef"[(v >> i) & 0xf]);
++	}
++}
++
++static void
++sweet_stall_fire(thread_call_param_t p0, thread_call_param_t p1)
++{
++#pragma unused(p0, p1)
++	vm_offset_t va = ml_io_map(STALL_PA, STALL_SIZE);
++	if (!va) {
++		return;
++	}
++	sbuf = (char *)va;
++	spos = 0;
++	s_s("T now=");
++	s_x(mach_absolute_time());
++	s_s(" threads=");
++	s_x((uint64_t)threads_count);
++	s_c('\n');
++
++	bool locked = lck_mtx_try_lock(&tasks_threads_lock);
++	thread_t th;
++	queue_iterate(&threads, th, thread_t, threads) {
++		s_s("TH ");
++		s_x((uint64_t)th->thread_id);
++		s_s(" st=");
++		s_x(th->state);
++		s_s(" pri=");
++		s_x((uint64_t)th->sched_pri);
++		s_s(" wev=");
++		s_x((uint64_t)th->wait_event);
++		s_s(" cont=");
++		s_x((uint64_t)(uintptr_t)th->continuation);
++		s_s(" wr=");
++		s_x((uint64_t)th->wait_result);
++		s_c('\n');
++		vm_offset_t kstack = th->kernel_stack;
++		if (kstack && th->machine.kstackptr) {
++			thread_kernel_state_t ks = (thread_kernel_state_t)th->machine.kstackptr;
++			uint64_t fp = ks->machine.ss.fp;
++			s_s(" lr ");
++			s_x(ks->machine.ss.lr);
++			s_c('\n');
++			for (int d = 0; d < 14; d++) {
++				if ((fp & 0xf) || fp < kstack || fp + 16 > kstack + kernel_stack_size) {
++					break;
++				}
++				uint64_t nfp = *(uint64_t *)fp;
++				uint64_t lr = *(uint64_t *)(fp + 8);
++				s_s(" lr ");
++				s_x(lr);
++				s_c('\n');
++				if (nfp <= fp) {
++					break;
++				}
++				fp = nfp;
++			}
++		}
++	}
++	if (locked) {
++		lck_mtx_unlock(&tasks_threads_lock);
++	}
++	s_s("END\n");
++	const char *m = "SWEETDUMP";
++	for (int i = 0; i < 9; i++) {
++		sbuf[i] = m[i];
++	}
++	*(volatile uint32_t *)(sbuf + 12) = spos;
++	__builtin_arm_dsb(DSB_SY);
++
++	/* APSS watchdog bite after ~2 s (qcom,kpss-wdt: RST 0x04, EN 0x08, BARK 0x10, BITE 0x14, 32.768 kHz) */
++	volatile uint32_t *w = (volatile uint32_t *)ml_io_map(STALL_WDT, 0x1000);
++	if (w) {
++		w[2] = 0;
++		w[1] = 1;
++		w[4] = 32768;
++		w[5] = 65536;
++		w[2] = 1;
++		__builtin_arm_dsb(DSB_SY);
++	}
++}
++
++void sweet_stall_arm(uint32_t seconds);
++void
++sweet_stall_arm(uint32_t seconds)
++{
++	static thread_call_t call;
++	uint64_t deadline;
++
++	if (!seconds || call) {
++		return;
++	}
++	call = thread_call_allocate(sweet_stall_fire, NULL);
++	nanoseconds_to_deadline((uint64_t)seconds * NSEC_PER_SEC, &deadline);
++	thread_call_enter_delayed(call, deadline);
++}
++#endif /* SWEET */
+diff --git c/osfmk/conf/files.arm64 w/osfmk/conf/files.arm64
+index b0dad49..b28fef0 100644
+--- c/osfmk/conf/files.arm64
++++ w/osfmk/conf/files.arm64
+@@ -41,6 +41,7 @@ osfmk/arm/arm_timer.c		standard
+ osfmk/arm/arm_init.c	optional config_pmap_ppl
+ osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl
+ osfmk/arm64/sweet_early.c	standard
++osfmk/arm64/sweet_stall.c	standard
+ osfmk/arm64/arm64_hypercall.c	standard
+ osfmk/arm/io_map.c		standard
+ osfmk/arm64/loose_ends.c	standard
