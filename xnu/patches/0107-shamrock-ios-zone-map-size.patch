@@ -1,0 +1,14 @@
+diff --git c/osfmk/kern/zalloc.c w/osfmk/kern/zalloc.c
+index 6ff4ee2..e717630 100644
+--- c/osfmk/kern/zalloc.c
++++ w/osfmk/kern/zalloc.c
+@@ -160,7 +160,8 @@ ZONE_DEFINE_TYPE(percpu_u64_zone, "percpu.64", uint64_t,
+ #define ZONE_GUARD_SPARSE       (64  * 1024)
+ #endif /* ZSECURITY_CONFIG(SAD_FENG_SHUI) */
+ 
+-#if XNU_PLATFORM_MacOSX
++/* shamrock: the macOS 128GB zone VA does not fit the 4K kernel VA range; use the iOS sizes */
++#if XNU_PLATFORM_MacOSX && !defined(SWEET)
+ #define ZONE_MAP_MAX            (32ULL << 30)
+ #define ZONE_MAP_VA_SIZE        (128ULL << 30)
+ #else /* XNU_PLATFORM_MacOSX */
