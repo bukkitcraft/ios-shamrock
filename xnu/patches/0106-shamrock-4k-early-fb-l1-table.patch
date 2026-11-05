@@ -1,0 +1,20 @@
+diff --git c/osfmk/arm64/arm_vm_init.c w/osfmk/arm64/arm_vm_init.c
+index b0f7d45..4b74d46 100644
+--- c/osfmk/arm64/arm_vm_init.c
++++ w/osfmk/arm64/arm_vm_init.c
+@@ -1838,7 +1838,14 @@ sweet_early_map_final(void)
+ {
+ 	const vm_map_address_t va = SWEET_EARLY_FB_VA;
+ 	assert(va + SWEET_EARLY_FB_BLOCKS * ARM_TT_L2_SIZE <= gVirtBase);
+-	tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
++	tt_entry_t *l1p = &cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
++	if (*l1p == ARM_TTE_EMPTY) {
++		/* shamrock: with 4K pages one L1 entry covers only 1GB and none exists here yet */
++		vm_offset_t pg = alloc_ptpage(FALSE);
++		bzero((void *)pg, ARM_PGBYTES);
++		*l1p = (kvtophys(pg) & ARM_TTE_TABLE_MASK) | ARM_TTE_TYPE_TABLE | ARM_TTE_VALID;
++	}
++	tt_entry_t l1 = *l1p;
+ 	assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
+ 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
+ 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
