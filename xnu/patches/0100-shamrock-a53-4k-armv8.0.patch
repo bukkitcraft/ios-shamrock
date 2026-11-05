@@ -1,0 +1,31 @@
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 9a748ea..b61d530 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -61,7 +61,7 @@ MACHINE_FLAGS_ARM64_T8103 = -DARM64_BOARD_CONFIG_T8103                  -mcpu=ap
+ MACHINE_FLAGS_ARM64_T6000 = -DARM64_BOARD_CONFIG_T6000 		-mcpu=apple-a14
+ MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
+ MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837
+-MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8.2-a+crypto
++MACHINE_FLAGS_ARM64_SWEET = -DARM64_BOARD_CONFIG_SWEET                -march=armv8-a -mtune=cortex-a53
+ 
+ 
+ #
+diff --git a/pexpert/pexpert/arm64/SWEET.h b/pexpert/pexpert/arm64/SWEET.h
+index b99c2f4..b5d597e 100644
+--- a/pexpert/pexpert/arm64/SWEET.h
++++ b/pexpert/pexpert/arm64/SWEET.h
+@@ -32,9 +32,10 @@
+ #define __ARM_COHERENT_CACHE__    1
+ #define __ARM_DEBUG__             7
+ #define __ARM_ENABLE_SWAP__       1
+-#define __ARM_V8_CRYPTO_EXTENSIONS__ 1
+-#define __ARM_PAN_AVAILABLE__     1
+-#define __ARM_16K_PG__            1
++/* shamrock: enable only if ID_AA64ISAR0.AES != 0 on MSM8952 (S0 prints it) */
++/* shamrock: Cortex-A53 is ARMv8.0, no PAN */
++/* shamrock: Cortex-A53 has no 16K granule: 4K pages (BCM2837-style) */
++#define __ARM64_PMAP_SUBPAGE_L1__ 1
+ 
+ #define HAS_GIC_V3                1
+ 
