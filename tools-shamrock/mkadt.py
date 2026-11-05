@@ -40,11 +40,22 @@ QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
 
 # shamrock: --gicv2 describes a GICv2 (GICD + GICC) instead of GICv3 (GICD + GICR): second reg pair = CPU interface
-if '--gicv2' in sys.argv:
+SHAMROCK = '--shamrock' in sys.argv
+GICV2 = SHAMROCK or '--gicv2' in sys.argv
+if GICV2:
     QEMU_GICR, GICR_SIZE = 0x08010000, 0x10000   # QEMU virt,gic-version=2: GICC at 0x08010000
     GICR, GICR_SIZE = 0x0b002000, 0x1000         # MSM8952 GICC; GICD is patched below
     GICD, GICD_SIZE = 0x0b000000, 0x1000
     VTIMER_INTID = 20                            # QCOM virtual timer = PPI 4 -> INTID 20
+if SHAMROCK:
+    # GM 5 Plus: xnu RAM sits above every TrustZone/modem carve-out (0x85b00000-0x8da00000 and the
+    # dynamic pools below 0x8e800000). The first 9MB at 0x90000000 hold the 32bpp scanout buffer the shim
+    # programs MDP5 to display (1080*1920*4 = 0x7e9000). Real DRAM banks must still be confirmed live.
+    FB, FB_SIZE = 0x90000000, 0x900000
+    FB_W, FB_H, FB_STRIDE = 1080, 1920, 1080 * 4
+    PHYS_BASE = 0x91000000
+    MEM_SIZE = 0xbff00000 - PHYS_BASE
+    TIMEBASE = 19200000
 
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
@@ -141,12 +152,14 @@ def build(seed=None, qemu=False, highmem=False):
     # and uses cpus=N to select an initial prefix (N <= 8).
     # QEMU retains its original single-CPU tree: its MPIDRs differ from sweet.
     cpu_nodes = []
+    # shamrock: 2 clusters x 4 Cortex-A53; the boot CPU is MPIDR 0x100 (measured by S0), so it comes first.
+    mpidrs = [0x100, 0x101, 0x102, 0x103, 0x000, 0x001, 0x002, 0x003] if SHAMROCK else [c << 8 for c in range(8)]
     for core in range(1 if qemu else 8):
         cpu_nodes.append(node(f'cpu{core}', [
             ph(),
             ('device_type', cstr('cpu')),
-            ('compatible', cstr('qcom,kryo470') + cstr('ARM,v8')),
-            ('reg', u32(core << 8)),  # actual MPIDR Aff1:Aff0, NOT logical ID
+            ('compatible', (cstr('ARM,cortex-a53') if SHAMROCK else cstr('qcom,kryo470')) + cstr('ARM,v8')),
+            ('reg', u32(mpidrs[core])),  # actual MPIDR Aff1:Aff0, NOT logical ID
             ('cpu-id', u32(core)),   # descriptive: XNU assigns IDs by DT order
             ('cluster-id', u32(0)),  # descriptive; see ml_parse_cpu_topology
             ('cluster-type', u32(0)),  # homogeneous CLUSTER_TYPE_SMP, not AMP
@@ -167,7 +180,7 @@ def build(seed=None, qemu=False, highmem=False):
 
     gic = node('gic', [
         ph(),
-        ('compatible', cstr('arm,gic-400' if '--gicv2' in sys.argv else 'arm,gic-v3')),
+        ('compatible', cstr('arm,gic-400' if GICV2 else 'arm,gic-v3')),
         ('interrupt-controller', b''),
         ('virtual-timer-intid', u32(QEMU_VTIMER_INTID if qemu else VTIMER_INTID)),
         ('reg', u64(gicd - SOC_BASE, GICD_SIZE, gicr - SOC_BASE, GICR_SIZE)),
@@ -238,14 +251,14 @@ def build(seed=None, qemu=False, highmem=False):
     # (iPhone10,3). 'xiaomi,sweet' stays for SweetPlatformExpert matching.
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + cstr('qcom,sm7150') + cstr('AppleARM')),
+        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,sweet') + (cstr('generalmobile,shamrock') + cstr('qcom,msm8952') if SHAMROCK else cstr('qcom,sm7150')) + cstr('AppleARM')),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if (qemu or SHAMROCK) else [ufs]))
 
 
 if __name__ == '__main__':

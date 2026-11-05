@@ -1,0 +1,17 @@
+diff --git c/osfmk/arm/arm_init.c w/osfmk/arm/arm_init.c
+index 42362c5..7cd94c3 100644
+--- c/osfmk/arm/arm_init.c
++++ w/osfmk/arm/arm_init.c
+@@ -399,7 +399,12 @@ arm_init(
+ 		/*
+ 		 * Select the advertised kernel page size.
+ 		 */
++#if defined(SWEET)
++		/* shamrock: always advertise 16KB kernel pages (4 hardware PTEs each) so the iPhone X userland sees 16K */
++		if (1) {
++#else
+ 		if (args->memSize > 1ULL * 1024 * 1024 * 1024) {
++#endif
+ 			/*
+ 			 * arm64 device with > 1GB of RAM:
+ 			 * kernel uses 16KB pages.
