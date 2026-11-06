@@ -1,0 +1,37 @@
+diff --git c/osfmk/arm64/sweet_stall.c w/osfmk/arm64/sweet_stall.c
+index e972736..c312407 100644
+--- c/osfmk/arm64/sweet_stall.c
++++ w/osfmk/arm64/sweet_stall.c
+@@ -17,6 +17,7 @@
+ #include <arm64/proc_reg.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/arm64/board_config.h>
++#include <sys/msgbuf.h>
+ 
+ #if defined(SWEET)
+ #define STALL_PA   0xbff40000ULL
+@@ -108,6 +109,24 @@ sweet_stall_fire(thread_call_param_t p0, thread_call_param_t p1)
+ 	if (locked) {
+ 		lck_mtx_unlock(&tasks_threads_lock);
+ 	}
++	/* tail of the kernel message buffer (printf/IOLog/hfs messages): msg_bufx is the write pointer of a ring */
++	if (msgbufp && msgbufp->msg_magic == MSG_MAGIC && msgbufp->msg_bufc && msgbufp->msg_size > 0) {
++		int size = msgbufp->msg_size;
++		int n = size < 24576 ? size : 24576;
++		int x = msgbufp->msg_bufx;
++		s_s("MSGBUF\n");
++		for (int i = n; i > 0; i--) {
++			int idx = (x - i) % size;
++			if (idx < 0) {
++				idx += size;
++			}
++			char c = msgbufp->msg_bufc[idx];
++			if (c == '\n' || (c >= 0x20 && c < 0x7f)) {
++				s_c(c);
++			}
++		}
++		s_s("\n");
++	}
+ 	s_s("END\n");
+ 	const char *m = "SWEETDUMP";
+ 	for (int i = 0; i < 9; i++) {
