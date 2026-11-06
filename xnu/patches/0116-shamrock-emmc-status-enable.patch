@@ -1,0 +1,64 @@
+diff --git c/bsd/dev/sweet_emmc.c w/bsd/dev/sweet_emmc.c
+index db3587b..5be9871 100644
+--- c/bsd/dev/sweet_emmc.c
++++ w/bsd/dev/sweet_emmc.c
+@@ -100,6 +100,8 @@ timed_out(uint64_t t0, uint32_t us)
+ 	return mach_absolute_time() - t0 > d;
+ }
+ 
++static uint32_t last_int, last_pres, last_resp_idx;
++
+ static void
+ cmd_reset(void)
+ {
+@@ -142,6 +144,7 @@ send_cmd(unsigned idx, uint32_t arg, unsigned flags, uint32_t *resp)
+ 	for (;;) {
+ 		uint32_t st = hr(0x30);
+ 		if (st & 0x8000) {
++			last_int = st; last_pres = hr(0x24); last_resp_idx = idx;
+ 			hw(0x30, 0xffffffff);
+ 			cmd_reset();
+ 			return -2;
+@@ -150,6 +153,7 @@ send_cmd(unsigned idx, uint32_t arg, unsigned flags, uint32_t *resp)
+ 			break;
+ 		}
+ 		if (timed_out(t0, 200000)) {
++			last_int = st; last_pres = hr(0x24); last_resp_idx = idx;
+ 			cmd_reset();
+ 			return -3;
+ 		}
+@@ -221,6 +225,7 @@ emmc_hw_init(void)
+ 
+ 	cw(0x78, 1);                                    /* CORE_HC_MODE: SDHCI interface on */
+ 	hw(0x28, 0x00000b00);                           /* host ctl 1-bit, power 1.8V on */
++	hw(0x34, 0x0000ffff);                           /* normal+error status enable (signals off): CC must be able to latch */
+ 	hw(0x2c, hr(0x2c) | 0x4);
+ 	udelay(10000);
+ 	{
+@@ -253,14 +258,23 @@ emmc_hw_init(void)
+ 			}
+ 			udelay(1000);
+ 		}
++		ELOG("SWEET EMMC: CMD1 e=%d ocr=0x%x\n", e, ocr);
+ 		if (e || !(ocr & 0x80000000u)) {
+ 			ELOG("SWEET EMMC: CMD1 failed e=%d ocr=0x%x err=0x%x pres=0x%x\n", e, ocr, hr(0x30), hr(0x24));
+ 			return ENXIO;
+ 		}
+ 	}
+-	if (send_cmd(2, 0, 0x09, &resp) || send_cmd(3, 1u << 16, 0x1a, &resp)) {
+-		ELOG("SWEET EMMC: CMD2/CMD3 failed pres=0x%x int=0x%x\n", hr(0x24), hr(0x30));
+-		return ENXIO;
++	{
++		int e2 = send_cmd(2, 0, 0x09, &resp);
++		ELOG("SWEET EMMC: CMD2 e=%d int=0x%x pres=0x%x\n", e2, last_int, last_pres);
++		if (e2) {
++			return ENXIO;
++		}
++		int e3 = send_cmd(3, 1u << 16, 0x1a, &resp);
++		ELOG("SWEET EMMC: CMD3 e=%d r=0x%x\n", e3, resp);
++		if (e3) {
++			return ENXIO;
++		}
+ 	}
+ 	set_clock(4);                                   /* 25 MHz */
+ 	if (send_cmd(7, 1u << 16, 0x1b, &resp)) {
