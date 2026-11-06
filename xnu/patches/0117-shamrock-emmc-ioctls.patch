@@ -1,0 +1,33 @@
+diff --git c/bsd/dev/sweet_emmc.c w/bsd/dev/sweet_emmc.c
+index 5be9871..a611e1a 100644
+--- c/bsd/dev/sweet_emmc.c
++++ w/bsd/dev/sweet_emmc.c
+@@ -450,10 +450,27 @@ sweet_emmc_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag
+ 	case DKIOCGETBLOCKCOUNT:
+ 		*(uint64_t *)data = se.nblocks;
+ 		return 0;
++	case DKIOCSETBLOCKSIZE: {
++		/* spec_open sets the block size to 512 and back; the device is 512-byte native */
++		uint32_t bs = *(uint32_t *)data;
++		if (bs < DEV_BSIZE || bs > 4096 || (bs & (bs - 1))) {
++			return EINVAL;
++		}
++		return 0;
++	}
+ 	case DKIOCGETMAXBLOCKCOUNTREAD:
+-	case DKIOCGETMAXBLOCKCOUNTWRITE:
+ 		*(uint64_t *)data = 1;
+ 		return 0;
++	case DKIOCGETMAXBLOCKCOUNTWRITE:
++		*(uint64_t *)data = 0;
++		return 0;
++	case DKIOCGETMAXSEGMENTCOUNTREAD:
++	case DKIOCGETMAXSEGMENTCOUNTWRITE:
++		*(uint64_t *)data = 1;
++		return 0;
++	case DKIOCSYNCHRONIZE:
++	case DKIOCSYNCHRONIZECACHE:
++		return 0;
+ 	case DKIOCISWRITABLE:
+ 		*(uint32_t *)data = 0;
+ 		return 0;
