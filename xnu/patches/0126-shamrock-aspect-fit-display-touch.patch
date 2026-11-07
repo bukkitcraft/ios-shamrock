@@ -1,0 +1,1447 @@
+diff --git c/iokit/Kernel/arm/SweetAdreno.cpp w/iokit/Kernel/arm/SweetAdreno.cpp
+new file mode 100644
+index 0000000..e4d7b0b
+--- /dev/null
++++ w/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -0,0 +1,715 @@
++/*
++ * SweetAdreno.cpp: Qualcomm Adreno 405 (A4xx) GPU driver and HakiosGPU service for MSM8952.
++ */
++
++#include <pexpert/arm64/board_config.h>
++
++#if defined(SWEET)
++
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOSubMemoryDescriptor.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <mach/vm_param.h>
++#include <sys/systm.h>
++#include <sys/proc_internal.h>
++
++#include "SweetSurface.h"
++#include "a4xx_regs.h"
++#include "a420_pfp_fw.h"
++#include "a420_pm4_fw.h"
++
++extern "C" {
++void *ml_io_map(uint64_t phys_addr, uint64_t size);
++uint64_t kvtophys(uint64_t va);
++void flush_dcache64(uint64_t addr, unsigned count, int phys);
++void delay(int microseconds);
++void delay_for_interval(uint32_t interval, uint32_t unit);
++uint64_t mach_absolute_time(void);
++void proc_selfname(char *buf, int size);
++}
++
++#define SHAMROCK_GCC_PA   0x01800000ULL
++#define SHAMROCK_GPU_PA   0x01c00000ULL
++
++#define OXILI_GX_GDSCR    0x5901c
++#define GCC_OXILI_GFX3D   0x59020
++#define GCC_OXILI_GMEM    0x59024
++#define GCC_OXILI_AHB     0x59028
++#define GFX3D_CLK_SRC_CMD 0x59000
++#define GFX3D_CLK_SRC_CFG 0x59004
++
++#define RING_WORDS        8192
++#define RING_SIZE         (RING_WORDS * 4)
++
++#define pm4_pkt0(reg, cnt) (CP_TYPE0_PKT | (((cnt) - 1) << 16) | ((reg) & 0x7fff))
++#define pm4_pkt2()         (CP_TYPE2_PKT)
++#define pm4_pkt3(op, cnt)  (CP_TYPE3_PKT | (((cnt) - 1) << 16) | (((op) & 0xff) << 8))
++
++static volatile uint32_t *g_gcc;
++static volatile uint32_t *g_gpu;
++static volatile uint32_t *g_ring;
++static uint64_t g_ring_phys;
++static uint32_t g_ring_wptr = 0;
++static uint32_t g_fence = 0;
++static bool g_ready = false;
++
++static inline void gpu_write(uint32_t reg, uint32_t val)
++{
++	g_gpu[reg] = val;
++}
++
++static inline uint32_t gpu_read(uint32_t reg)
++{
++	return g_gpu[reg];
++}
++
++static inline void gcc_write(uint32_t reg, uint32_t val)
++{
++	g_gcc[reg >> 2] = val;
++}
++
++static inline uint32_t gcc_read(uint32_t reg)
++{
++	return g_gcc[reg >> 2];
++}
++
++static void ring_out(uint32_t val)
++{
++	g_ring[g_ring_wptr] = val;
++	g_ring_wptr = (g_ring_wptr + 1) % RING_WORDS;
++}
++
++static void ring_flush(void)
++{
++	flush_dcache64((uint64_t)g_ring, RING_SIZE, 0);
++	gpu_write(REG_A4XX_CP_RB_WPTR, g_ring_wptr);
++}
++
++static bool a4xx_idle(void)
++{
++	for (int i = 0; i < 50000; i++) {
++		uint32_t rptr = gpu_read(REG_A4XX_CP_RB_RPTR);
++		if (rptr == g_ring_wptr) {
++			return true;
++		}
++		delay(20);
++	}
++	return false;
++}
++
++static bool power_on_oxili(void)
++{
++	uint32_t val = gcc_read(OXILI_GX_GDSCR);
++	val &= ~1u;
++	gcc_write(OXILI_GX_GDSCR, val);
++
++	bool ok = false;
++	for (int i = 0; i < 1000; i++) {
++		if (gcc_read(OXILI_GX_GDSCR) & (1u << 31)) {
++			ok = true;
++			break;
++		}
++		delay(10);
++	}
++	if (!ok) {
++		IOLog("SWEET A405: OXILI_GX_GDSC power on timeout\n");
++		return false;
++	}
++
++	gcc_write(GFX3D_CLK_SRC_CFG, (1 << 8) | (2 - 1));
++	gcc_write(GFX3D_CLK_SRC_CMD, 1);
++	delay(50);
++
++	gcc_write(GCC_OXILI_AHB, gcc_read(GCC_OXILI_AHB) | 1);
++	gcc_write(GCC_OXILI_GFX3D, gcc_read(GCC_OXILI_GFX3D) | 1);
++	gcc_write(GCC_OXILI_GMEM, gcc_read(GCC_OXILI_GMEM) | 1);
++	delay(50);
++
++	IOLog("SWEET A405: clocks enabled\n");
++	return true;
++}
++
++static bool a4xx_hw_init(void)
++{
++	gpu_write(REG_A4XX_VBIF_ROUND_ROBIN_QOS_ARB, 0x00000003);
++	gpu_write(REG_A4XX_RBBM_GPU_BUSY_MASKED, 0xffffffff);
++	gpu_write(REG_A4XX_RBBM_SP_HYST_CNT, 0x10);
++	gpu_write(REG_A4XX_RBBM_WAIT_IDLE_CLOCKS_CTL, 0x10);
++	gpu_write(REG_A4XX_RBBM_AHB_CTL0, 0x00000001);
++	gpu_write(REG_A4XX_RBBM_AHB_CTL1, 0xa6ffffff);
++	gpu_write(REG_A4XX_RBBM_RBBM_CTL, 0x00000030);
++	gpu_write(REG_A4XX_RBBM_INTERFACE_HANG_INT_CTL, (1 << 30) | 0xffff);
++	gpu_write(REG_A4XX_RB_GMEM_BASE_ADDR, 0);
++	gpu_write(REG_A4XX_RBBM_PERFCTR_CTL, 0x01);
++	gpu_write(REG_A4XX_CP_PERFCTR_CP_SEL_0, 0);
++
++	gpu_write(REG_A4XX_UCHE_TRAP_BASE_LO, 0xffff0000);
++	gpu_write(REG_A4XX_UCHE_TRAP_BASE_HI, 0x0001ffff);
++	gpu_write(REG_A4XX_CP_DEBUG, (1 << 25));
++
++	gpu_write(REG_A4XX_RBBM_SP_REGFILE_SLEEP_CNTL_0, 0x00000441);
++	gpu_write(REG_A4XX_RBBM_SP_REGFILE_SLEEP_CNTL_1, 0x00000441);
++
++	gpu_write(REG_A4XX_CP_PROTECT_CTRL, 0x00000007);
++	gpu_write(REG_A4XX_CP_PROTECT(0), 0x62000010);
++	gpu_write(REG_A4XX_CP_PROTECT(1), 0x63000020);
++	gpu_write(REG_A4XX_CP_PROTECT(2), 0x64000040);
++	gpu_write(REG_A4XX_CP_PROTECT(3), 0x65000080);
++	gpu_write(REG_A4XX_CP_PROTECT(4), 0x66000100);
++	gpu_write(REG_A4XX_CP_PROTECT(5), 0x64000200);
++	gpu_write(REG_A4XX_CP_PROTECT(6), 0x67000800);
++	gpu_write(REG_A4XX_CP_PROTECT(7), 0x64001600);
++	gpu_write(REG_A4XX_CP_PROTECT(8), 0x60003300);
++	gpu_write(REG_A4XX_CP_PROTECT(9), 0x60003800);
++	gpu_write(REG_A4XX_CP_PROTECT(10), 0x61003980);
++	gpu_write(REG_A4XX_CP_PROTECT(11), 0x6e010000);
++
++	gpu_write(REG_A4XX_RBBM_INT_0_MASK, 0);
++
++	gpu_write(REG_A4XX_CP_RB_CNTL, 0x0000000f | (1 << 27));
++	gpu_write(REG_A4XX_CP_RB_BASE, (uint32_t)g_ring_phys);
++
++	/* Load PM4 ucode */
++	gpu_write(REG_A4XX_CP_ME_RAM_WADDR, 0);
++	for (uint32_t i = 1; i < a420_pm4_fw_len; i++) {
++		gpu_write(REG_A4XX_CP_ME_RAM_DATA, a420_pm4_fw[i]);
++	}
++
++	/* Load PFP ucode */
++	gpu_write(REG_A4XX_CP_PFP_UCODE_ADDR, 0);
++	for (uint32_t i = 1; i < a420_pfp_fw_len; i++) {
++		gpu_write(REG_A4XX_CP_PFP_UCODE_DATA, a420_pfp_fw[i]);
++	}
++
++	gpu_write(REG_A4XX_CP_ME_CNTL, 0);
++
++	/* CP_ME_INIT */
++	ring_out(pm4_pkt3(CP_ME_INIT, 17));
++	ring_out(0x000003f7);
++	ring_out(0x00000000);
++	ring_out(0x00000000);
++	ring_out(0x00000000);
++	ring_out(0x00000080);
++	ring_out(0x00000100);
++	ring_out(0x00000180);
++	ring_out(0x00006600);
++	ring_out(0x00000150);
++	ring_out(0x0000014e);
++	ring_out(0x00000154);
++	ring_out(0x00000001);
++	ring_out(0x00000000);
++	ring_out(0x00000000);
++	ring_out(0x00000000);
++	ring_out(0x00000000);
++	ring_out(0x00000000);
++	ring_flush();
++
++	if (!a4xx_idle()) {
++		IOLog("SWEET A405: CP_ME_INIT timeout\n");
++		return false;
++	}
++
++	IOLog("SWEET A405: Adreno 405 initialized (RB_BASE=0x%llx)\n", g_ring_phys);
++	return true;
++}
++
++extern "C" {
++
++bool hakios_gpu_ready(void) { return g_ready; }
++uint32_t hakios_gpu_last(void) { return g_fence; }
++
++bool hakios_gpu_parameter(uint32_t which, uint64_t *value)
++{
++	switch (which) {
++	case 0x01:
++	case 0x06:
++	case 0x08:
++	case 0x09:
++	case 0x0a:
++	case 0x11:
++	case 0x12:
++	case 0x13:
++		*value = 0;
++		return true;
++	case 0x02:
++		*value = 256 * 1024;
++		return true;
++	case 0x03:
++		*value = 0x04000500ULL;
++		return true;
++	case 0x04:
++		*value = 400000000ULL;
++		return true;
++	case 0x05:
++		*value = mach_absolute_time();
++		return true;
++	case 0x07:
++		*value = 1;
++		return true;
++	case 0x10:
++		*value = 14;
++		return true;
++	default:
++		return false;
++	}
++}
++
++uint64_t hakios_gpu_address(uint64_t size);
++void hakios_gpu_address_free(uint64_t address, uint64_t size);
++bool hakios_gpu_map(uint64_t address, uint64_t phys, bool read_only);
++void hakios_gpu_mapped(void);
++void hakios_gpu_unmap(uint64_t address, uint64_t size);
++void hakios_gpu_to_memory(void *start, uint64_t size);
++uint32_t hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
++bool hakios_gpu_done(uint32_t fence);
++
++uint64_t hakios_gpu_address(uint64_t size) { (void)size; return 0; }
++void hakios_gpu_address_free(uint64_t address, uint64_t size) { (void)address; (void)size; }
++bool hakios_gpu_map(uint64_t address, uint64_t phys, bool read_only) { (void)address; (void)phys; (void)read_only; return true; }
++void hakios_gpu_mapped(void) {}
++void hakios_gpu_unmap(uint64_t address, uint64_t size) { (void)address; (void)size; }
++void hakios_gpu_to_memory(void *start, uint64_t size) { flush_dcache64((uint64_t)start, (unsigned)size, 0); }
++
++uint32_t hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
++{
++	if (!g_ready || count == 0) return 0;
++
++	for (uint32_t i = 0; i < count; i++) {
++		ring_out(pm4_pkt3(CP_INDIRECT_BUFFER_PFE, 2));
++		ring_out((uint32_t)addresses[i]);
++		ring_out(words[i]);
++		ring_out(pm4_pkt2());
++	}
++
++	if (++g_fence == 0) g_fence = 1;
++
++	ring_out(pm4_pkt0(REG_AXXX_CP_SCRATCH_REG2, 1));
++	ring_out(g_fence);
++	ring_out(pm4_pkt3(CP_EVENT_WRITE, 1));
++	ring_out(HLSQ_FLUSH);
++	ring_out(pm4_pkt3(CP_WAIT_FOR_IDLE, 1));
++	ring_out(pm4_pkt3(CP_EVENT_WRITE, 1));
++	ring_out(CACHE_FLUSH_TS);
++	ring_flush();
++	return g_fence;
++}
++
++bool hakios_gpu_done(uint32_t fence)
++{
++	if (!g_ready) return true;
++	uint32_t cur = gpu_read(REG_AXXX_CP_SCRATCH_REG2);
++	return (int32_t)(cur - fence) >= 0;
++}
++
++} /* extern "C" */
++
++/* ---------------- HakiosGPU Service and UserClient ---------------- */
++
++struct msm_timespec {
++	int64_t tv_sec;
++	int64_t tv_nsec;
++};
++
++struct msm_gem_new {
++	uint64_t size;
++	uint32_t flags;
++	uint32_t handle;
++};
++
++struct msm_gem_info {
++	uint32_t handle;
++	uint32_t info;
++	uint64_t value;
++};
++
++struct msm_gem_cpu_prep {
++	uint32_t handle;
++	uint32_t op;
++	struct msm_timespec timeout;
++};
++
++struct msm_gem_submit_cmd {
++	uint32_t type;
++	uint32_t submit_idx;
++	uint32_t submit_offset;
++	uint32_t size;
++	uint32_t pad;
++	uint32_t nr_relocs;
++	uint64_t relocs;
++};
++
++struct msm_gem_submit_bo {
++	uint32_t flags;
++	uint32_t handle;
++	uint64_t presumed;
++	uint64_t reserved;
++};
++
++struct msm_gem_submit {
++	uint32_t flags;
++	uint32_t fence;
++	uint32_t nr_bos;
++	uint32_t nr_cmds;
++	uint64_t bos;
++	uint64_t cmds;
++	int32_t  fence_fd;
++	uint32_t queueid;
++	uint64_t in_syncobjs;
++	uint64_t out_syncobjs;
++	uint32_t nr_in_syncobjs;
++	uint32_t nr_out_syncobjs;
++	uint32_t syncobj_stride;
++	uint32_t pad;
++};
++
++struct msm_wait_fence {
++	uint32_t fence;
++	uint32_t flags;
++	struct msm_timespec timeout;
++	uint32_t queueid;
++};
++
++struct msm_gem_madvise {
++	uint32_t handle;
++	uint32_t madv;
++	uint32_t retained;
++};
++
++struct msm_submitqueue {
++	uint32_t flags;
++	uint32_t prio;
++	uint32_t id;
++};
++
++struct msm_submitqueue_query {
++	uint64_t data;
++	uint32_t id;
++	uint32_t param;
++	uint32_t len;
++	uint32_t pad;
++};
++
++struct drm_gem_close {
++	uint32_t handle;
++	uint32_t pad;
++};
++
++struct hakios_surface {
++	uint32_t surface;
++	uint32_t handle;
++	uint64_t size;
++	uint32_t offset;
++	uint32_t rowBytes;
++	uint32_t width;
++	uint32_t height;
++	uint32_t pixelFormat;
++	uint32_t planes;
++};
++
++#define kHakiosDescribe        0xffffffffu
++#define kMsmGetParam           0
++#define kMsmSetParam           1
++#define kMsmGemNew             2
++#define kMsmGemInfo            3
++#define kMsmGemCpuPrep         4
++#define kMsmGemCpuFini         5
++#define kMsmGemSubmit          6
++#define kMsmWaitFence          7
++#define kMsmGemMadvise         8
++#define kMsmSubmitQueueNew     9
++#define kMsmSubmitQueueClose   10
++#define kMsmSubmitQueueQuery   11
++#define kHakiosSurface         0x7c
++#define kDrmGemClose           0x7f
++
++#define MSM_INFO_GET_OFFSET    0
++#define MSM_INFO_GET_IOVA      1
++#define MSM_INFO_SET_NAME      2
++#define MSM_PREP_NOSYNC        0x04
++#define GPU_BUFFERS            2048
++
++struct gpu_buffer {
++	IOMemoryDescriptor *memory;
++	uint8_t            *kernel;
++	uint64_t            phys;
++	uint64_t            size;
++	uint32_t            flags;
++	SweetSurface       *surface;
++};
++
++static IOLock *gGPULock;
++
++class HakiosGPUUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(HakiosGPUUserClient);
++
++private:
++	task_t fTask;
++	struct gpu_buffer *fBuffers;
++	uint32_t fNextBuffer;
++
++	struct gpu_buffer *buffer(uint32_t handle) {
++		if (handle == 0 || handle > GPU_BUFFERS || fBuffers == NULL) return NULL;
++		struct gpu_buffer *b = &fBuffers[handle - 1];
++		return b->memory != NULL ? b : NULL;
++	}
++
++public:
++	bool initWithTask(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties) APPLE_KEXT_OVERRIDE {
++		if (!IOUserClient::initWithTask(owningTask, securityID, type, properties)) return false;
++		fTask = owningTask;
++		return true;
++	}
++
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE {
++		if (!hakios_gpu_ready() || !IOUserClient::start(provider)) return false;
++		fBuffers = (struct gpu_buffer *)IOMallocZero(sizeof(struct gpu_buffer) * GPU_BUFFERS);
++		return fBuffers != NULL;
++	}
++
++	IOReturn clientClose() APPLE_KEXT_OVERRIDE {
++		terminate();
++		return kIOReturnSuccess;
++	}
++
++	void free() APPLE_KEXT_OVERRIDE {
++		if (fBuffers) {
++			for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
++				if (fBuffers[i].memory) {
++					if (fBuffers[i].surface) fBuffers[i].surface->release();
++					else fBuffers[i].memory->release();
++				}
++			}
++			IOFree(fBuffers, sizeof(struct gpu_buffer) * GPU_BUFFERS);
++			fBuffers = NULL;
++		}
++		IOUserClient::free();
++	}
++
++	IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE {
++		IOLockLock(gGPULock);
++		struct gpu_buffer *b = buffer(type);
++		if (b == NULL || b->memory == NULL) {
++			IOLockUnlock(gGPULock);
++			return kIOReturnBadArgument;
++		}
++		*memory = b->memory;
++		(*memory)->retain();
++		*options = kIOMapAnywhere;
++		IOLockUnlock(gGPULock);
++		return kIOReturnSuccess;
++	}
++
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(HakiosGPUUserClient, IOUserClient);
++
++IOReturn
++HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference)
++{
++	(void)dispatch; (void)target; (void)reference;
++	if (!args->structureInput || !fBuffers) return kIOReturnBadArgument;
++	if (!hakios_gpu_ready()) return kIOReturnNotReady;
++
++	switch (selector) {
++	case kMsmGetParam: {
++		struct { uint32_t param; uint32_t pad; uint64_t value; } p;
++		memcpy(&p, args->structureInput, sizeof(p));
++		bool ok = hakios_gpu_parameter(p.param, &p.value);
++		if (ok && args->structureOutput && args->structureOutputSize >= sizeof(p)) {
++			memcpy(args->structureOutput, &p, sizeof(p));
++			return kIOReturnSuccess;
++		}
++		return ok ? kIOReturnSuccess : kIOReturnBadArgument;
++	}
++	case kMsmGemNew: {
++		struct msm_gem_new req;
++		memcpy(&req, args->structureInput, sizeof(req));
++		uint64_t size = (req.size + 4095) & ~4095ULL;
++		IOBufferMemoryDescriptor *mem = IOBufferMemoryDescriptor::inTaskWithOptions(
++		    kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, (vm_size_t)size, PAGE_SIZE);
++		if (!mem) return kIOReturnNoMemory;
++		bzero(mem->getBytesNoCopy(), (size_t)size);
++
++		IOLockLock(gGPULock);
++		uint32_t h = (fNextBuffer++) % GPU_BUFFERS;
++		struct gpu_buffer *b = &fBuffers[h];
++		b->memory = mem;
++		b->kernel = (uint8_t *)mem->getBytesNoCopy();
++		b->phys = kvtophys((uint64_t)b->kernel);
++		b->size = size;
++		b->surface = NULL;
++		req.handle = h + 1;
++		IOLockUnlock(gGPULock);
++
++		if (args->structureOutput && args->structureOutputSize >= sizeof(req)) {
++			memcpy(args->structureOutput, &req, sizeof(req));
++		}
++		return kIOReturnSuccess;
++	}
++	case kMsmGemInfo: {
++		struct msm_gem_info info;
++		memcpy(&info, args->structureInput, sizeof(info));
++		IOLockLock(gGPULock);
++		struct gpu_buffer *b = buffer(info.handle);
++		if (!b) { IOLockUnlock(gGPULock); return kIOReturnBadArgument; }
++		if (info.info == MSM_INFO_GET_OFFSET) info.value = info.handle;
++		else if (info.info == MSM_INFO_GET_IOVA) info.value = b->phys;
++		IOLockUnlock(gGPULock);
++		if (args->structureOutput && args->structureOutputSize >= sizeof(info)) {
++			memcpy(args->structureOutput, &info, sizeof(info));
++		}
++		return kIOReturnSuccess;
++	}
++	case kMsmGemCpuPrep:
++	case kMsmGemCpuFini:
++		return kIOReturnSuccess;
++	case kMsmGemSubmit: {
++		struct msm_gem_submit req;
++		memcpy(&req, args->structureInput, sizeof(req));
++		if (req.nr_cmds > 16) return kIOReturnBadArgument;
++		struct msm_gem_submit_cmd cmds[16];
++		if (copyin((user_addr_t)req.cmds, cmds, req.nr_cmds * sizeof(cmds[0])) != 0) {
++			return kIOReturnBadArgument;
++		}
++
++		uint64_t addrs[16];
++		uint32_t words[16];
++		IOLockLock(gGPULock);
++		for (uint32_t i = 0; i < req.nr_cmds; i++) {
++			struct gpu_buffer *b = buffer(cmds[i].submit_idx + 1);
++			addrs[i] = b ? (b->phys + cmds[i].submit_offset) : 0;
++			words[i] = cmds[i].size / 4;
++		}
++		req.fence = hakios_gpu_submit(addrs, words, req.nr_cmds);
++		IOLockUnlock(gGPULock);
++
++		if (args->structureOutput && args->structureOutputSize >= sizeof(req)) {
++			memcpy(args->structureOutput, &req, sizeof(req));
++		}
++		return kIOReturnSuccess;
++	}
++	case kMsmWaitFence: {
++		struct msm_wait_fence w;
++		memcpy(&w, args->structureInput, sizeof(w));
++		for (int i = 0; i < 5000; i++) {
++			if (hakios_gpu_done(w.fence)) return kIOReturnSuccess;
++			delay(100);
++		}
++		return kIOReturnTimeout;
++	}
++	case kHakiosSurface: {
++		struct hakios_surface sreq;
++		memcpy(&sreq, args->structureInput, sizeof(sreq));
++		SweetSurface *s = sweet_surface_copy(sreq.surface);
++		if (!s) return kIOReturnNotFound;
++
++		sreq.size = s->allocSize ? s->allocSize : (s->height * s->bytesPerRow);
++		sreq.offset = s->offset;
++		sreq.rowBytes = s->bytesPerRow;
++		sreq.width = s->width;
++		sreq.height = s->height;
++		sreq.pixelFormat = s->pixelFormat;
++		sreq.planes = 1;
++
++		if (sreq.handle == kHakiosDescribe) {
++			s->release();
++			if (args->structureOutput && args->structureOutputSize >= sizeof(sreq)) {
++				memcpy(args->structureOutput, &sreq, sizeof(sreq));
++			}
++			return kIOReturnSuccess;
++		}
++
++		IOLockLock(gGPULock);
++		uint32_t h = (fNextBuffer++) % GPU_BUFFERS;
++		struct gpu_buffer *b = &fBuffers[h];
++		b->memory = s->memory;
++		b->kernel = (uint8_t *)s->kernelAddress();
++		b->phys = kvtophys((uint64_t)b->kernel);
++		b->size = sreq.size;
++		b->surface = s;
++		sreq.handle = h + 1;
++		IOLockUnlock(gGPULock);
++
++		if (args->structureOutput && args->structureOutputSize >= sizeof(sreq)) {
++			memcpy(args->structureOutput, &sreq, sizeof(sreq));
++		}
++		return kIOReturnSuccess;
++	}
++	case kDrmGemClose: {
++		struct drm_gem_close cl;
++		memcpy(&cl, args->structureInput, sizeof(cl));
++		IOLockLock(gGPULock);
++		struct gpu_buffer *b = buffer(cl.handle);
++		if (b) {
++			if (b->surface) b->surface->release();
++			else if (b->memory) b->memory->release();
++			bzero(b, sizeof(*b));
++		}
++		IOLockUnlock(gGPULock);
++		return kIOReturnSuccess;
++	}
++	default:
++		return kIOReturnSuccess;
++	}
++}
++
++class SweetAdreno : public IOService {
++	OSDeclareDefaultStructors(SweetAdreno);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetAdreno, IOService);
++
++bool
++SweetAdreno::start(IOService *provider)
++{
++	if (!IOService::start(provider)) return false;
++
++	int gpu_enabled = 0;
++	PE_parse_boot_argn("sweetgpu", &gpu_enabled, sizeof(gpu_enabled));
++	if (!gpu_enabled) {
++		IOLog("SWEET A405: disabled (pass sweetgpu=1 in boot-args to enable)\n");
++		return false;
++	}
++
++	IOLog("SWEET A405: initializing Qualcomm Adreno 405...\n");
++
++	g_gcc = (volatile uint32_t *)ml_io_map(SHAMROCK_GCC_PA, 0x60000);
++	g_gpu = (volatile uint32_t *)ml_io_map(SHAMROCK_GPU_PA, 0x10000);
++
++	if (!g_gcc || !g_gpu) {
++		IOLog("SWEET A405: failed to map MMIO registers\n");
++		return false;
++	}
++
++	static uint32_t s_rb[RING_WORDS] __attribute__((aligned(4096)));
++	g_ring = s_rb;
++	g_ring_phys = kvtophys((uint64_t)g_ring);
++	gGPULock = IOLockAlloc();
++
++	if (!power_on_oxili() || !a4xx_hw_init()) {
++		IOLog("SWEET A405: hardware initialization failed\n");
++		return false;
++	}
++
++	g_ready = true;
++	setProperty(kIOUserClientClassKey, "HakiosGPUUserClient");
++	setName("HakiosGPU");
++	registerService();
++	IOLog("SWEET A405: HakiosGPU service registered successfully!\n");
++	return true;
++}
++
++#endif /* SWEET */
+diff --git c/iokit/Kernel/arm/SweetFramebuffer.cpp w/iokit/Kernel/arm/SweetFramebuffer.cpp
+index c69d379..617d4da 100644
+--- c/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ w/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -78,8 +78,8 @@ enum {
+  * centered 1080x2400 part of it is shown on the 1080x2400 panel.
+  * Boot-arg sweetfb_native=1 presents the real panel size instead.
+  */
+-#define SWEET_FB_LOGICAL_W              1125
+-#define SWEET_FB_LOGICAL_H              2436
++#define SWEET_FB_LOGICAL_W              1242
++#define SWEET_FB_LOGICAL_H              2208
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
+ class IOMobileFramebuffer : public IOService {
+@@ -177,11 +177,19 @@ AppleCLCD::start(IOService *provider)
+ 		fLogicalW = arg_w;
+ 		fLogicalH = arg_h;
+ 	} else if (!native) {
+-		OSNumber *numW = OSDynamicCast(OSNumber, provider->getProperty("canvas-width"));
+-		OSNumber *numH = OSDynamicCast(OSNumber, provider->getProperty("canvas-height"));
+-		if (numW != NULL && numH != NULL) {
+-			fLogicalW = numW->unsigned32BitValue();
+-			fLogicalH = numH->unsigned32BitValue();
++		OSObject *objW = provider->getProperty("canvas-width");
++		OSObject *objH = provider->getProperty("canvas-height");
++		if (objW != NULL && objH != NULL) {
++			if (OSNumber *numW = OSDynamicCast(OSNumber, objW)) {
++				fLogicalW = numW->unsigned32BitValue();
++			} else if (OSData *dataW = OSDynamicCast(OSData, objW)) {
++				if (dataW->getLength() >= 4) fLogicalW = *(const uint32_t *)dataW->getBytesNoCopy();
++			}
++			if (OSNumber *numH = OSDynamicCast(OSNumber, objH)) {
++				fLogicalH = numH->unsigned32BitValue();
++			} else if (OSData *dataH = OSDynamicCast(OSData, objH)) {
++				if (dataH->getLength() >= 4) fLogicalH = *(const uint32_t *)dataH->getBytesNoCopy();
++			}
+ 		} else if (fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+ 			fLogicalW = SWEET_FB_LOGICAL_W;
+ 			fLogicalH = SWEET_FB_LOGICAL_H;
+@@ -406,22 +414,55 @@ AppleCLCD::present(const uint8_t *rec)
+ 		if (src != 0 && bpe == 4) {
+ 			int noscale = 0;
+ 			PE_parse_boot_argn("sweetfb_noscale", &noscale, sizeof(noscale));
+-			if (!noscale && s->width == fLogicalW && s->height == fLogicalH &&
+-			    (fWidth != fLogicalW || fHeight != fLogicalH)) {
+-				/* Scale logical screen (1125x2436) to physical panel (e.g. 1080x1920) without clipping */
+-				uint32_t sx_map[1080];
+-				uint32_t max_w = fWidth <= 1080 ? fWidth : 1080;
+-				for (uint32_t px = 0; px < max_w; px++) {
+-					sx_map[px] = (px * s->width) / fWidth;
+-				}
+-				for (uint32_t py = 0; py < fHeight; py++) {
+-					uint32_t sy_coord = (py * s->height) / fHeight;
+-					const uint32_t *src_row = (const uint32_t *)(src + s->offset +
+-					    (uint64_t)sy_coord * s->bytesPerRow);
+-					volatile uint32_t *dst_row = (volatile uint32_t *)(fPixels +
+-					    (uint64_t)py * fRowBytes);
++			int fit = 1;
++			PE_parse_boot_argn("sweetfb_fit", &fit, sizeof(fit));
++			if (!noscale && (fWidth != s->width || fHeight != s->height)) {
++				if (fit && s->height > 0 && fHeight > 0) {
++					/*
++					 * 1:1 Aspect-Fit (Uniform scaling):
++					 * Scale uniformly so circular elements (Apple boot logo, clock, icons)
++					 * remain 100% round with zero distortion / squashing.
++					 * Fits full height (1920) and centers width (~886) with black pillarbox borders.
++					 */
++					uint32_t fit_w = (s->width * fHeight) / s->height;
++					if (fit_w > fWidth) fit_w = fWidth;
++					uint32_t off_x = (fWidth - fit_w) / 2;
++					uint32_t sx_map[1080];
++					for (uint32_t px = 0; px < fit_w; px++) {
++						sx_map[px] = (px * s->width) / fit_w;
++					}
++					for (uint32_t py = 0; py < fHeight; py++) {
++						uint32_t sy_coord = (py * s->height) / fHeight;
++						const uint32_t *src_row = (const uint32_t *)(src + s->offset +
++						    (uint64_t)sy_coord * s->bytesPerRow);
++						volatile uint32_t *dst_row = (volatile uint32_t *)(fPixels +
++						    (uint64_t)py * fRowBytes);
++						for (uint32_t px = 0; px < off_x; px++) {
++							dst_row[px] = 0xff000000u;
++						}
++						for (uint32_t px = 0; px < fit_w; px++) {
++							dst_row[off_x + px] = src_row[sx_map[px]];
++						}
++						for (uint32_t px = off_x + fit_w; px < fWidth; px++) {
++							dst_row[px] = 0xff000000u;
++						}
++					}
++				} else {
++					/* Legacy anamorphic stretch */
++					uint32_t sx_map[1080];
++					uint32_t max_w = fWidth <= 1080 ? fWidth : 1080;
+ 					for (uint32_t px = 0; px < max_w; px++) {
+-						dst_row[px] = src_row[sx_map[px]];
++						sx_map[px] = (px * s->width) / fWidth;
++					}
++					for (uint32_t py = 0; py < fHeight; py++) {
++						uint32_t sy_coord = (py * s->height) / fHeight;
++						const uint32_t *src_row = (const uint32_t *)(src + s->offset +
++						    (uint64_t)sy_coord * s->bytesPerRow);
++						volatile uint32_t *dst_row = (volatile uint32_t *)(fPixels +
++						    (uint64_t)py * fRowBytes);
++						for (uint32_t px = 0; px < max_w; px++) {
++							dst_row[px] = src_row[sx_map[px]];
++						}
+ 					}
+ 				}
+ 			} else {
+diff --git c/iokit/Kernel/arm/a420_pfp_fw.h w/iokit/Kernel/arm/a420_pfp_fw.h
+new file mode 100644
+index 0000000..61a81d3
+--- /dev/null
++++ w/iokit/Kernel/arm/a420_pfp_fw.h
+@@ -0,0 +1,142 @@
++/* Auto-generated firmware array for a420_pfp_fw */
++#pragma once
++#include <stdint.h>
++
++static const uint32_t a420_pfp_fw_len = 1073;
++static const uint32_t a420_pfp_fw[] = {
++    0x00000000, 0x00c60400, 0x00c4240d, 0x00a00000, 0x000e7c0f, 0x004ff087, 0x00c43c3a, 0x00000000,
++    0x00880000, 0x00000000, 0x00280c2d, 0x00c10223, 0x00c41800, 0x00c40800, 0x00cf002c, 0x00cc802d,
++    0x00c10225, 0x00c41000, 0x00c41400, 0x00cf002c, 0x00cd402d, 0x00c10227, 0x00091c01, 0x00cf002c,
++    0x00d00c00, 0x0099c3fe, 0x0009dc01, 0x0005b806, 0x00c18224, 0x0009a401, 0x00326410, 0x007e724c,
++    0x00ce4003, 0x00d40003, 0x00800000, 0x00000000, 0x00800001, 0x00c60400, 0x00cc4003, 0x00800000,
++    0x00d60003, 0x00c60800, 0x00c10d0c, 0x00cf002c, 0x00248801, 0x00800000, 0x00cc802d, 0x00c4143b,
++    0x00994000, 0x00c4143b, 0x00880000, 0x00000000, 0x00c60800, 0x00c61c00, 0x0084002e, 0x00c62400,
++    0x00d0018e, 0x00978069, 0x004ddc01, 0x00c10d0a, 0x00cf002c, 0x00cc802d, 0x00c60400, 0x00d20004,
++    0x00cc4004, 0x008000a1, 0x00d20004, 0x00c60800, 0x00c60c00, 0x0084002e, 0x0034cc02, 0x00281c04,
++    0x00ccc007, 0x00cdc007, 0x008403e7, 0x00cc4003, 0x00c4241c, 0x00c41c1c, 0x004ddc01, 0x00d0018e,
++    0x00d00383, 0x008000a1, 0x00d00383, 0x00c60800, 0x00c60c00, 0x00c61000, 0x00c61c00, 0x0084002e,
++    0x0035dc02, 0x00282405, 0x00cdc007, 0x00ce4007, 0x008403e7, 0x00cc4003, 0x00c10d0a, 0x00cf002c,
++    0x00cc802d, 0x00c4241c, 0x00c41c1c, 0x004ddc01, 0x00ccc004, 0x00d00384, 0x0080004e, 0x00cd0004,
++    0x00c4142e, 0x00994000, 0x00c4142e, 0x00c1020f, 0x00c20004, 0x007f348c, 0x008403e7, 0x00cc802c,
++    0x00c40c3e, 0x0034cc10, 0x0024cc07, 0x0098c3fb, 0x00280401, 0x00c61800, 0x00c61c00, 0x004ddc01,
++    0x00c60c00, 0x0034cc02, 0x00ccc007, 0x00cc4007, 0x008403e7, 0x00c61000, 0x00c4241c, 0x00351002,
++    0x007e5144, 0x00954003, 0x007e5241, 0x007c0240, 0x0084002e, 0x00c10d09, 0x00cf002c, 0x00c60400,
++    0x00cc402d, 0x008403f0, 0x00c4080c, 0x007cc140, 0x008403f0, 0x00348810, 0x0034f010, 0x0030cc10,
++    0x009b0007, 0x007cd4c0, 0x007cd704, 0x004ccc01, 0x007d8080, 0x0097000d, 0x00ccc00e, 0x00080c01,
++    0x008000a1, 0x00ccc00e, 0x0033cc0e, 0x007c8c8c, 0x00280401, 0x00304c13, 0x00c0efff, 0x00280405,
++    0x008000a9, 0x00243c00, 0x009bc3f8, 0x00348c17, 0x0024cc03, 0x00280401, 0x0098c028, 0x00c43c27,
++    0x00c0efff, 0x00304c13, 0x0009dc01, 0x007cb48b, 0x0095c007, 0x007c8c8c, 0x0030d007, 0x007c908c,
++    0x00cc801e, 0x008000b5, 0x007c8c8d, 0x00281c01, 0x00284402, 0x00cc801e, 0x0009dc01, 0x009bc00e,
++    0x00ce401e, 0x00d00323, 0x00cc4003, 0x0099c3fa, 0x00244406, 0x00245002, 0x00990343, 0x00000000,
++    0x00281c01, 0x0031d01a, 0x007c908d, 0x008000b4, 0x00284402, 0x008403e7, 0x00000000, 0x00c4302d,
++    0x009b03f1, 0x00000000, 0x00840247, 0x00c43426, 0x008000b8, 0x00cc0017, 0x00cc800a, 0x00cc400b,
++    0x00c4180e, 0x00cc0009, 0x007e4080, 0x00cc001f, 0x00cc001f, 0x00c40c1d, 0x007c9b92, 0x00ccc01e,
++    0x009bc01f, 0x00cf801e, 0x00c41019, 0x00051100, 0x00cd0003, 0x00cc4003, 0x007c0040, 0x00cc002e,
++    0x00d00343, 0x00cc0003, 0x0084002e, 0x00c40c1e, 0x00ccc01e, 0x00cf801e, 0x00c41019, 0x00051100,
++    0x00cd0003, 0x007cb881, 0x007c8103, 0x001dd401, 0x007d150c, 0x00311401, 0x002d5402, 0x00cd4003,
++    0x009883e3, 0x00cd0009, 0x0009dc01, 0x0099c3de, 0x00cc000b, 0x00800001, 0x00c60400, 0x008403e7,
++    0x00000000, 0x00c4302d, 0x009b03e0, 0x00000000, 0x00840247, 0x00c43426, 0x00c4180e, 0x008000d9,
++    0x00cc0017, 0x00d2000c, 0x00cc001f, 0x00800000, 0x00cc001f, 0x00cc0026, 0x00cc001d, 0x0026ecff,
++    0x00800025, 0x00cc002e, 0x00c4081f, 0x00c60c00, 0x00c40c20, 0x00988000, 0x00c4081f, 0x00cc4003,
++    0x00ccc003, 0x00d60003, 0x00ccc022, 0x00cc001f, 0x00800000, 0x00cc001f, 0x00c60800, 0x00c60c00,
++    0x00c61433, 0x00d022a0, 0x00cca018, 0x00cce000, 0x009942e5, 0x00cce005, 0x00800000, 0x00062001,
++    0x00c60800, 0x00c20004, 0x008403ea, 0x007cb48c, 0x00349014, 0x0025101f, 0x007cd0c9, 0x0024cc01,
++    0x0030cc00, 0x0026effe, 0x00800000, 0x007ececc, 0x000a2001, 0x00800001, 0x00c60400, 0x002aee00,
++    0x0026c980, 0x00800169, 0x002c9180, 0x00cc401c, 0x00cc001c, 0x00c20004, 0x00c10200, 0x008403ea,
++    0x007f348c, 0x0034cc02, 0x00281013, 0x00ccc001, 0x00cd0001, 0x00281005, 0x00ccc001, 0x00cc0001,
++    0x009903fe, 0x00091001, 0x008403e7, 0x00281002, 0x00c104db, 0x008403ea, 0x007f348c, 0x0024cc04,
++    0x0098c3fb, 0x00000000, 0x009903fa, 0x00091001, 0x00c104c4, 0x008403ea, 0x007f348c, 0x0098c3fd,
++    0x00000000, 0x00cc401c, 0x00cc401c, 0x00cc401c, 0x00360c01, 0x0094c2ac, 0x00cc001c, 0x00800000,
++    0x000a2001, 0x00cc0026, 0x00800001, 0x00c60400, 0x00c60800, 0x0026ce80, 0x009483fb, 0x0026eeff,
++    0x00308808, 0x00800168, 0x002cd280, 0x00c60800, 0x0026cf00, 0x009483f4, 0x0026ef7f, 0x00308807,
++    0x002cd300, 0x007ecacc, 0x00990297, 0x00280401, 0x00800132, 0x00cc4026, 0x009a0293, 0x00c61000,
++    0x0026efbf, 0x00311006, 0x00800000, 0x007ed2cc, 0x0026c840, 0x009481a1, 0x00c62400, 0x00c61c00,
++    0x00c61800, 0x00ce400e, 0x00cdc00f, 0x00c41039, 0x00c41438, 0x00c40437, 0x00c41c36, 0x00c42435,
++    0x00d6001f, 0x00c103f3, 0x008403e7, 0x00cf0033, 0x00840005, 0x00000000, 0x0027f433, 0x009b4008,
++    0x0027f5c0, 0x009b4278, 0x00000000, 0x0084037e, 0x00c109c3, 0x00800180, 0x00000000, 0x00c104d6,
++    0x00d00363, 0x00d001c3, 0x00c4080f, 0x00cf002c, 0x00cc8003, 0x00cc802d, 0x00c20004, 0x00c10201,
++    0x008403ea, 0x007f348c, 0x0034c81b, 0x00248801, 0x00988007, 0x00c10203, 0x008403ea, 0x007f348c,
++    0x00d00363, 0x00ccc003, 0x00cd0003, 0x00c10218, 0x008403ea, 0x007f348c, 0x008403ea, 0x00ccc00e,
++    0x00ccc00f, 0x00c40c3c, 0x0024cc03, 0x0098c3ff, 0x00c40c3c, 0x00c10219, 0x00cf002c, 0x00cc002d,
++    0x00c12020, 0x00c21b20, 0x007f34cc, 0x00c10218, 0x00cf002c, 0x00ccc02d, 0x00c10580, 0x00c20004,
++    0x008403ea, 0x007f348c, 0x00283401, 0x00cc0000, 0x00cf4000, 0x00cc0001, 0x00cf4001, 0x00c1058a,
++    0x0027fc02, 0x00cf002c, 0x009bc010, 0x00cd002d, 0x000e3c02, 0x009bc008, 0x000e3c01, 0x007dc1cb,
++    0x007e424b, 0x009bc004, 0x00000000, 0x007d414b, 0x007c404b, 0x00cd402d, 0x00cc402d, 0x00cdc02d,
++    0x00ce402d, 0x00cec02d, 0x00c43c3c, 0x009bc000, 0x00c43c3c, 0x00c10200, 0x00cf002c, 0x00ccc02d,
++    0x00c10219, 0x00c4100e, 0x00c4140f, 0x00cf002c, 0x00cd402d, 0x00c10218, 0x00cf002c, 0x00cd002d,
++    0x008403ea, 0x00281407, 0x00281004, 0x00cd401b, 0x00cd0010, 0x00cc001b, 0x00c28000, 0x007cc10c,
++    0x007cf4cc, 0x00c10201, 0x00cf002c, 0x00ccc02d, 0x008403ea, 0x00c10203, 0x00cf002c, 0x00ccc02d,
++    0x008403ea, 0x00c10202, 0x00cf002c, 0x00ccc02d, 0x008403ea, 0x00c10205, 0x00cf002c, 0x00ccc02d,
++    0x00c10201, 0x00cf002c, 0x00cd002d, 0x008403ea, 0x007e020b, 0x008403ea, 0x007cc100, 0x00950009,
++    0x00000000, 0x0094c007, 0x00351402, 0x00cd4000, 0x00cd0018, 0x00ccc000, 0x00ccc005, 0x00282001,
++    0x008403ea, 0x00000000, 0x008403ea, 0x007cc100, 0x00950009, 0x00000000, 0x0094c007, 0x00351402,
++    0x00cd4001, 0x00cd0019, 0x00ccc001, 0x00ccc006, 0x00282002, 0x008403ea, 0x0026ec40, 0x00c2c000,
++    0x007ececc, 0x009582fa, 0x00cc002f, 0x007f408c, 0x00c14000, 0x007cb08c, 0x00cc8003, 0x00800112,
++    0x00cd8003, 0x0097c205, 0x00000000, 0x00800315, 0x00000000, 0x009bc0f1, 0x00280c03, 0x00cc4003,
++    0x00d20003, 0x00c60800, 0x00d20003, 0x00348802, 0x00cc8002, 0x00800000, 0x00ccc002, 0x00c2000f,
++    0x00c60800, 0x00c61000, 0x00348c18, 0x007cb58b, 0x00ccc011, 0x00998006, 0x00cc8015, 0x009b83f9,
++    0x00cd0014, 0x00800001, 0x00c60400, 0x00359810, 0x002d9408, 0x007c03c0, 0x009943f9, 0x00cd8010,
++    0x00cd0014, 0x00cc001f, 0x00cc001f, 0x00840250, 0x00c43426, 0x00cc0015, 0x00800236, 0x00c2000f,
++    0x00080c01, 0x0097c022, 0x0027d001, 0x0037fc01, 0x009503fd, 0x0004cc01, 0x00ccc011, 0x00cc001f,
++    0x00cc001f, 0x00c41024, 0x00c41422, 0x00c41825, 0x00351002, 0x00c1ffff, 0x00a9140e, 0x007db18b,
++    0x007f4d49, 0x00255401, 0x0095400a, 0x00c43023, 0x00a5b3ed, 0x007db144, 0x00994006, 0x00000000,
++    0x007d3100, 0x00cd8013, 0x00800265, 0x007db181, 0x00cd0012, 0x00cd8013, 0x00cd0002, 0x00cd8002,
++    0x00d00143, 0x00800248, 0x00cd8003, 0x00880000, 0x00000000, 0x00cc0023, 0x00c1001f, 0x00cf0011,
++    0x00cc0012, 0x00cc0013, 0x009b03fd, 0x000b3001, 0x00cc4003, 0x00ce0003, 0x00cc000d, 0x00800000,
++    0x00d60003, 0x00ca0800, 0x00cc4003, 0x00248c3f, 0x000cd015, 0x00990008, 0x000cd009, 0x00990006,
++    0x0014d011, 0x00990003, 0x00000000, 0x001cd014, 0x0099017d, 0x00d60003, 0x00800000, 0x00cc001a,
++    0x00c60800, 0x00248801, 0x0040a40e, 0x00800112, 0x00ce400d, 0x00264c08, 0x00c60800, 0x0094c172,
++    0x00248801, 0x00308802, 0x0026640b, 0x0080028a, 0x007e4a4c, 0x00264c08, 0x00c60800, 0x0094c16a,
++    0x00c60c00, 0x00c4142e, 0x00994000, 0x00c4142e, 0x0034f802, 0x00349004, 0x0025100f, 0x000d1404,
++    0x000d1803, 0x0099402d, 0x000d1c02, 0x00998008, 0x000d1001, 0x0099c008, 0x007dc1d0, 0x00990007,
++    0x00288801, 0x00800000, 0x00000000, 0x00265403, 0x00994155, 0x007c9c8b, 0x00281006, 0x00cf8007,
++    0x00cd0007, 0x0026640c, 0x00c4101c, 0x00c4141c, 0x00c43c1c, 0x00c41c1c, 0x00c4181c, 0x00c41c1c,
++    0x009bc011, 0x000db3ff, 0x000df7ff, 0x007f370b, 0x007cb34b, 0x007dd5c1, 0x009b43f0, 0x007d9181,
++    0x009b03cb, 0x007dd90c, 0x002a7c02, 0x00950007, 0x0004cc08, 0x00d00363, 0x00ccc003, 0x00283c01,
++    0x00cfc003, 0x002a7c03, 0x00348808, 0x00248801, 0x0080028a, 0x007fca4d, 0x00ce000e, 0x00cec00f,
++    0x0024b50f, 0x00335004, 0x007f534c, 0x00281020, 0x00cf8007, 0x008402fe, 0x00cd0007, 0x007c4140,
++    0x008402fe, 0x007c8180, 0x007c41c0, 0x008402fe, 0x007c8200, 0x007c4240, 0x008402fe, 0x007c83c0,
++    0x007c42c0, 0x0084030a, 0x007c4300, 0x007dc140, 0x007e0180, 0x007c0dcc, 0x0084030a, 0x007c120c,
++    0x007e4140, 0x007fc180, 0x007dcdcc, 0x0084030a, 0x007e120c, 0x007ec140, 0x007f0180, 0x007dcdcc,
++    0x0084030a, 0x007e120c, 0x007dcdcc, 0x007e120c, 0x0099c3dc, 0x00c4240d, 0x00377404, 0x007e360d,
++    0x002a2002, 0x00262003, 0x0026640c, 0x007e624c, 0x00c4200e, 0x0080028a, 0x00c42c0f, 0x00c4041c,
++    0x00c4081c, 0x00c40c1c, 0x007c4d06, 0x007c9080, 0x000cd3ff, 0x007cc441, 0x00c40c1c, 0x007cc881,
++    0x000ccfff, 0x00880000, 0x007cd0cb, 0x008402fe, 0x00000000, 0x007c9902, 0x007c5446, 0x007d050b,
++    0x007c9846, 0x007d050c, 0x007d350b, 0x007cf4cb, 0x00880000, 0x00377401, 0x00800000, 0x00d6001f,
++    0x00c60800, 0x00348c1c, 0x000cd001, 0x000cd402, 0x0099000b, 0x0026cc01, 0x009543f8, 0x00c20004,
++    0x008403ea, 0x007cb48c, 0x007cc140, 0x00c60800, 0x008403ea, 0x007cb48c, 0x007cd4c2, 0x0098c3ef,
++    0x0094c015, 0x00281801, 0x00c60c00, 0x00c61000, 0x00c61400, 0x0034cc02, 0x00ccc007, 0x00cd8007,
++    0x00c4081c, 0x0094800c, 0x00351002, 0x00cd0007, 0x00cd8007, 0x00c4081c, 0x00c28000, 0x007d48c1,
++    0x007cf4c4, 0x0094c004, 0x00000000, 0x00800000, 0x00d2001f, 0x00ca3800, 0x0007b801, 0x008403e7,
++    0x00cf802b, 0x00800000, 0x00d6001f, 0x00c4081b, 0x00c20001, 0x007cb480, 0x00cc8003, 0x00d20003,
++    0x00c2000c, 0x00c1016e, 0x008403ea, 0x007f348c, 0x007cc100, 0x00c20004, 0x00c1016f, 0x008403ea,
++    0x007f348c, 0x00cd0003, 0x00800000, 0x00ccc003, 0x0084002e, 0x00c60800, 0x00c60c00, 0x00c61000,
++    0x00280401, 0x0034cc02, 0x00c28000, 0x00ccc007, 0x008403e7, 0x00cc4007, 0x00c4141c, 0x007d51c1,
++    0x007df704, 0x009703fa, 0x00000000, 0x00800001, 0x00c60400, 0x00cc002e, 0x00cc4003, 0x0084002e,
++    0x00d60003, 0x00800001, 0x00c60400, 0x00c40821, 0x0034881f, 0x00948094, 0x00000000, 0x0084037e,
++    0x00c109c0, 0x00800000, 0x00000000, 0x009a008e, 0x00c60800, 0x00c40c39, 0x00d00363, 0x00cc8003,
++    0x00ccc003, 0x00c2c000, 0x00c11200, 0x007f350c, 0x00cd0003, 0x00800000, 0x00cc0003, 0x007f03c0,
++    0x00c1ffff, 0x008403e7, 0x00cf0033, 0x00c4083a, 0x007cbc8b, 0x00988049, 0x00000000, 0x008403d2,
++    0x00000000, 0x00c4083a, 0x007cbc8b, 0x00988041, 0x00280801, 0x00cc803f, 0x00c2c000, 0x00c16100,
++    0x007f348c, 0x00cc002e, 0x00cc8003, 0x0084002e, 0x00cc0003, 0x00c20004, 0x00c10098, 0x008403ea,
++    0x007f348c, 0x0028cc01, 0x00cf002c, 0x00ccc02d, 0x008403ea, 0x007f348c, 0x00c4083f, 0x0024880f,
++    0x009883ff, 0x00c4083f, 0x00280802, 0x008403df, 0x00cc8025, 0x00280803, 0x00cc803f, 0x008403e7,
++    0x00cfc033, 0x00840005, 0x00000000, 0x00cc8025, 0x008403d2, 0x00000000, 0x00280802, 0x00cc803f,
++    0x00c20004, 0x00c10098, 0x008403ea, 0x007f348c, 0x0028cc01, 0x002ccc01, 0x00cf002c, 0x00ccc02d,
++    0x008403ea, 0x007f348c, 0x00c4083f, 0x00248810, 0x009483ff, 0x00c4083f, 0x00c101b0, 0x008403ea,
++    0x007f348c, 0x0024cc04, 0x0098c3fd, 0x00000000, 0x00c2c000, 0x00c16100, 0x007f348c, 0x00280c01,
++    0x00cc002e, 0x00cc8003, 0x0084002e, 0x00ccc003, 0x008403df, 0x00000000, 0x00280801, 0x00cc803e,
++    0x00cc003f, 0x00880000, 0x00cc003e, 0x00280c20, 0x00c4083f, 0x007c8c8b, 0x009883ff, 0x00c4083f,
++    0x00280801, 0x00cc803d, 0x00c4083f, 0x007c8c8b, 0x009483ff, 0x00c4083f, 0x00880000, 0x00000000,
++    0x00280c20, 0x00cc003d, 0x00c4083f, 0x007c8c8b, 0x009883ff, 0x00c4083f, 0x00880000, 0x00000000,
++    0x00cc001f, 0x00880000, 0x00cc001f, 0x00cc802c, 0x00cc001f, 0x00cc001f, 0x00c40c3e, 0x00880000,
++    0x00048801, 0x00344c08, 0x00349008, 0x007ccb11, 0x007c5351, 0x007f3700, 0x007cd351, 0x007c4911,
++    0x00337410, 0x00333008, 0x007f34c0, 0x00880000, 0x007cd0c0, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00050023, 0x00100315, 0x00110342, 0x00130364, 0x00140353, 0x0017012b, 0x0018012e,
++    0x001e0173, 0x00190287, 0x001a028c, 0x001c016d, 0x001d0162, 0x0023015b, 0x00240067, 0x00260107,
++    0x00280042, 0x00290052, 0x002d0109, 0x002f0104, 0x00330220, 0x00350100, 0x00380033, 0x0039011f,
++    0x003b0315, 0x003f0115, 0x00410224, 0x0043022e, 0x00440328, 0x00460278, 0x00470317, 0x0048026c,
++    0x004e0294, 0x005f0273, 0x0061036a, 0x00620372, 0x00640028, 0x00000025, 0x00000025, 0x00000025,
++    0x00000025, 0x00000025, 0x00000025, 0x00000025, 0x00000025, 0x00000025, 0x00000025, 0x00000025,
++    0x00000025,
++};
+diff --git c/iokit/Kernel/arm/a420_pm4_fw.h w/iokit/Kernel/arm/a420_pm4_fw.h
+new file mode 100644
+index 0000000..16474e9
+--- /dev/null
++++ w/iokit/Kernel/arm/a420_pm4_fw.h
+@@ -0,0 +1,306 @@
++/* Auto-generated firmware array for a420_pm4_fw */
++#pragma once
++#include <stdint.h>
++
++static const uint32_t a420_pm4_fw_len = 2389;
++static const uint32_t a420_pm4_fw[] = {
++    0x00000000, 0x004ff065, 0xc0200400, 0x00000000, 0x00000000, 0x0120000a, 0x00000000, 0x00000000,
++    0x00600000, 0x00000246, 0x0000ffff, 0x00280a21, 0x00000000, 0x00000000, 0x00494582, 0x0000000a,
++    0x00010035, 0x00204411, 0x00000000, 0x00000200, 0x00204811, 0x00000000, 0x00000000, 0x00400000,
++    0x00000007, 0x00000000, 0x00000000, 0x00000000, 0x0000ffff, 0x00284621, 0x00000000, 0x00000000,
++    0xd9004800, 0x00000000, 0x00000000, 0x00400000, 0x00000000, 0x00000000, 0x00600000, 0x00000246,
++    0x00002208, 0x0029462c, 0x00000000, 0x00000000, 0xc0404800, 0x00002000, 0x00000000, 0xc0204800,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000002, 0xc0480620, 0x00002017, 0x0000000d,
++    0x00220621, 0x00000000, 0x00000008, 0xc0214a20, 0x00000000, 0x00000001, 0x00205011, 0x00001000,
++    0x00000000, 0x14e00000, 0x0000001d, 0x0000000d, 0xc0220620, 0x00000000, 0x00000000, 0x1cc00000,
++    0x00000017, 0x00000000, 0x26c00000, 0x0000001f, 0x00000000, 0x1ec00000, 0x00002013, 0x000021dc,
++    0x0029462c, 0x00000000, 0xdeadbabe, 0x00204811, 0x00000000, 0x00000021, 0x00405011, 0x00000000,
++    0x00000000, 0x2cc00000, 0x00000106, 0x00000000, 0x00400000, 0x00000107, 0x00000000, 0x00600000,
++    0x00000253, 0x00000000, 0x1ee00000, 0x00000027, 0x00000001, 0x00205011, 0x00000000, 0x000021dc,
++    0x0029462c, 0x00000000, 0x0000babe, 0xc0204811, 0x00000000, 0x00000000, 0x1cc00000, 0x00000024,
++    0x00000001, 0xc0210220, 0x00000000, 0x00000000, 0x14c00000, 0x00000021, 0x00000031, 0x00205011,
++    0x00000000, 0x000021dc, 0x0029462c, 0x00000000, 0x0000babe, 0x00204811, 0x00000000, 0x000021d9,
++    0x0029462c, 0x00000000, 0x00000017, 0x00404811, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x40210220, 0x00000000, 0x00000000, 0x14c00000, 0x00000030, 0x00000000, 0x00201011,
++    0x00000000, 0xdead2abe, 0x00200c11, 0x00000000, 0x00000000, 0x1cc00000, 0x00000031, 0x00000000,
++    0x26e00000, 0x00000036, 0x00000000, 0x00600000, 0x00000253, 0x900d2abe, 0x00200c11, 0x00000000,
++    0x00000010, 0x00291224, 0x00000000, 0x00000000, 0x00201411, 0x00000000, 0x00000001, 0xc0210220,
++    0x00000000, 0x00000000, 0x14c00000, 0x0000003b, 0x00000020, 0x00291624, 0x00000000, 0x00000004,
++    0x00211224, 0x00000000, 0x00000001, 0x00295225, 0x00000000, 0x000021dc, 0x0029462c, 0x00000000,
++    0x00000000, 0x00204803, 0x00000000, 0x00000000, 0x00210224, 0x00000000, 0x00000000, 0x14c00000,
++    0x00000042, 0x000021d9, 0x0029462c, 0x00000000, 0x00000017, 0x00204811, 0x00000000, 0x00000000,
++    0x00400000, 0x00000000, 0x0001002c, 0x00204411, 0x00000000, 0x00000001, 0xc0204811, 0x00000000,
++    0x000104d2, 0x00204411, 0x00000000, 0x00000000, 0x00404811, 0x00000000, 0x000104d2, 0xc0204411,
++    0x00000000, 0x00000000, 0x00404811, 0x00000000, 0x0000001f, 0x40280a20, 0x00000000, 0x0000001d,
++    0xc0210e20, 0x00000000, 0x00000016, 0x002f0222, 0x00000000, 0x00000000, 0x0ce00000, 0x00000061,
++    0x00000004, 0x002f0222, 0x00000000, 0x00000000, 0x0ce00000, 0x00000063, 0x00000008, 0x002f0222,
++    0x00000000, 0x00000000, 0x0ce00000, 0x00000065, 0x00000015, 0x002f0222, 0x00000000, 0x00000000,
++    0x0ce00000, 0x0000006a, 0x00000009, 0x002f0222, 0x00000000, 0x00000000, 0x0ce00000, 0x0000006b,
++    0x00000011, 0x002f0222, 0x00000000, 0x00000000, 0x0ce00000, 0x00000070, 0x00000012, 0x002f0222,
++    0x00000000, 0x00000000, 0x0ce00000, 0x00000070, 0x00000013, 0x002f0222, 0x00000000, 0x00000000,
++    0x0ce00000, 0x00000070, 0x00000014, 0x002f0222, 0x00000000, 0x00000000, 0x0ce00000, 0x00000070,
++    0x0000001e, 0x002f0222, 0x00000000, 0x00000000, 0x0ce00000, 0x0000006f, 0x000021d9, 0x0029462c,
++    0x00000000, 0x00000000, 0x00404802, 0x00000000, 0x00010215, 0x00604411, 0x00000067, 0x00000000,
++    0x00400000, 0x0000005f, 0x0001020f, 0x00604411, 0x00000067, 0x00000000, 0x00400000, 0x0000005f,
++    0x00010212, 0x00604411, 0x00000067, 0x00000000, 0x00400000, 0x0000005f, 0x00000006, 0x00284a23,
++    0x00000000, 0x00000000, 0xc0204800, 0x00000000, 0x00000000, 0xc0804800, 0x00000000, 0xc5000000,
++    0x00404411, 0x0000006c, 0xc6000000, 0x00204411, 0x00000000, 0xc4000000, 0x00204411, 0x00000000,
++    0x000104d3, 0x00204411, 0x00000000, 0x00000000, 0x00404811, 0x0000005f, 0xc8000000, 0x00404411,
++    0x0000005f, 0xc7000000, 0x00204411, 0x00000000, 0x000021d9, 0x0029462c, 0x00000000, 0x00000000,
++    0x00204802, 0x00000000, 0x0001020f, 0x00204411, 0x00000000, 0x00000008, 0x00204811, 0x00000000,
++    0x00000000, 0x00204811, 0x00000000, 0x00000000, 0x00204811, 0x00000000, 0x000104d3, 0x00204411,
++    0x00000000, 0x00000000, 0x00204811, 0x00000000, 0x000021d9, 0x0029462c, 0x00000000, 0x00000004,
++    0x00404811, 0x00000000, 0x00007fff, 0x40682620, 0x000002cb, 0x00000000, 0x00200809, 0x00000000,
++    0x00280000, 0x00295a29, 0x00000000, 0x00000000, 0x00201414, 0x00000000, 0x80000000, 0x40280e20,
++    0x00000000, 0x40000000, 0x40281220, 0x00000000, 0x3f000000, 0xc0282220, 0x00000000, 0x00000018,
++    0x00212228, 0x00000000, 0x00000000, 0x002f0223, 0x00000000, 0x00000000, 0x0ae00000, 0x00000086,
++    0x00000000, 0xc0401800, 0x00000089, 0x00007fff, 0xc0682620, 0x000002c5, 0x00280000, 0x00295a29,
++    0x00000000, 0x00000000, 0x00201814, 0x00000000, 0x00000000, 0x002f0224, 0x00000000, 0x00000000,
++    0x0ae00000, 0x0000008c, 0x00000000, 0xc0401c00, 0x0000008f, 0x00007fff, 0xc0682620, 0x000002c5,
++    0x00280000, 0x00295a29, 0x00000000, 0x00000000, 0x00201c14, 0x00000000, 0x00000000, 0x00204402,
++    0x00000000, 0x00000000, 0x002824c5, 0x00000000, 0x0000001f, 0x00281228, 0x00000000, 0x00000000,
++    0x00242489, 0x00000000, 0x00000005, 0x00210228, 0x00000000, 0x00000000, 0x14c00000, 0x00000096,
++    0x00000000, 0x005048e9, 0x00000000, 0x00000000, 0x004948e9, 0x00000000, 0x0013ffff, 0xc0485a20,
++    0x0000000a, 0x00000000, 0x00600000, 0x00000246, 0x00000000, 0xc0200800, 0x00000000, 0x00000000,
++    0xc0200c00, 0x00000000, 0x00000011, 0x00210222, 0x00000000, 0x000023cb, 0x0029462c, 0x00001000,
++    0x00000000, 0x14c00000, 0x000000a0, 0x00000000, 0x00404802, 0x00002000, 0x00000000, 0x00204803,
++    0x00000000, 0xfffcffff, 0x00284a22, 0x00000000, 0x00000000, 0x00204803, 0x00000000, 0x00000012,
++    0x00211222, 0x00000000, 0x0000000f, 0x00281224, 0x00000000, 0x00000003, 0x00281623, 0x00000000,
++    0x00000000, 0x002f0225, 0x00000000, 0x00000000, 0x00301224, 0x00001000, 0x00000000, 0x0ce00000,
++    0x000020ab, 0x00000000, 0x0020188d, 0x00000000, 0x00000000, 0x00400000, 0x000020ac, 0x00000010,
++    0x00211a26, 0x00000000, 0x0000ffff, 0x00281a26, 0x00000000, 0x00000010, 0x00210222, 0x00000000,
++    0x00000000, 0x00294586, 0x00001000, 0x00000000, 0x14c00000, 0x0000000a, 0x00000002, 0x00211223,
++    0x00000000, 0x0000003f, 0x00281224, 0x00000000, 0x00000016, 0x00210a22, 0x00000000, 0x00000002,
++    0x00420a22, 0x00002281, 0x00000001, 0x00330a22, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00600000, 0x00000253, 0x000021d0, 0x0029462c, 0x00000000, 0x00000000, 0xc0404800,
++    0x00000000, 0x00000000, 0x00600000, 0x00000246, 0x00000000, 0xc0200800, 0x00000000, 0x000023d7,
++    0x0029462c, 0x00000000, 0x00000000, 0xc0204800, 0x00000000, 0x00000000, 0xc0204800, 0x00000000,
++    0x00000000, 0xc0604800, 0x00000253, 0x000021d0, 0x0029462c, 0x00000000, 0x00000000, 0x00404802,
++    0x00000000, 0x00000000, 0x00600000, 0x00000246, 0x00000000, 0xc0200800, 0x00000000, 0x00000000,
++    0xc0200c00, 0x00000000, 0x00000000, 0x00202012, 0x00000000, 0x00000000, 0x00202412, 0x00000000,
++    0x00000000, 0x00202812, 0x00000000, 0x00000000, 0x002f0228, 0x00000000, 0x00000000, 0x0ce00000,
++    0x00000000, 0x00000000, 0x002f0229, 0x00000000, 0x00000000, 0x0ce00000, 0x00000000, 0x00000000,
++    0x002f022a, 0x00000000, 0x00000000, 0x0ce00000, 0x00000000, 0x000023ce, 0x0029462c, 0x00000000,
++    0x00000002, 0x00211223, 0x00000000, 0x00000000, 0x00601408, 0x000000d9, 0x0000000c, 0x00211223,
++    0x00000000, 0x00000000, 0x00601409, 0x000000d9, 0x00000016, 0x00211223, 0x00000000, 0x00000000,
++    0x0060140a, 0x000000d9, 0x000023d7, 0x0029462c, 0x00000000, 0x00000000, 0x00204808, 0x00000000,
++    0x00000000, 0x00204809, 0x00000000, 0x00000000, 0x0060480a, 0x00000253, 0x000021d0, 0x0029462c,
++    0x00000000, 0x00000000, 0x00404802, 0x00000000, 0x000003ff, 0x00281224, 0x00000000, 0x00000001,
++    0x00301224, 0x00000000, 0x000000ff, 0x00281a25, 0x00000000, 0x00000000, 0x00381886, 0x00000000,
++    0x00000008, 0x00211e25, 0x00000000, 0x000000ff, 0x00281e27, 0x00000000, 0x00000000, 0x00381c87,
++    0x00000000, 0x00000008, 0x00221e27, 0x00000000, 0x00000000, 0x009048c7, 0x00002000, 0x00000000,
++    0x00204811, 0x00000000, 0xc4000000, 0xc0404411, 0x00000000, 0x00000000, 0x00600000, 0x00000246,
++    0x00000010, 0x40210a20, 0x00000000, 0x000000ff, 0x00280a22, 0x00000000, 0x000007ff, 0x40280e20,
++    0x00000000, 0x80000000, 0xc0282620, 0x00000000, 0x00000004, 0x002f0222, 0x00000000, 0x00000000,
++    0x0ae00000, 0x000001da, 0x00002000, 0x0029222c, 0x00000000, 0x00000000, 0x00201811, 0x00000000,
++    0x00000000, 0x002f0229, 0x00000000, 0x00000000, 0x0ce00000, 0x000000f2, 0x00007fff, 0xc0682620,
++    0x000002c5, 0x00280000, 0x00295a29, 0x00000000, 0x00000000, 0x00201814, 0x00000000, 0x00000000,
++    0x00304503, 0x00000000, 0x00000000, 0xd9104806, 0x00000000, 0x00000000, 0x00400000, 0x00000000,
++    0x0001020c, 0x00204411, 0x00000000, 0xfffffffc, 0xc0284a20, 0x00000000, 0x0001820d, 0x00404411,
++    0x0000000a, 0x00000000, 0x00000000, 0x00000000, 0x0001020c, 0x00204411, 0x00000000, 0xfffffffc,
++    0xc0284a20, 0x00000000, 0x00000000, 0xc0200800, 0x00000000, 0x00000000, 0xc0200c00, 0x00000000,
++    0x00000000, 0x002f0222, 0x00000000, 0x00000000, 0x0ce00000, 0x00000000, 0x0001820d, 0x00204411,
++    0x00000000, 0x00000001, 0x00330a22, 0x00000000, 0x00000000, 0x00204803, 0x00001000, 0x00000000,
++    0x0ae00000, 0x00002101, 0x00000001, 0x00330a22, 0x00000000, 0x00000000, 0x00400000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00600000, 0x00000246, 0xb2000000, 0x00204411,
++    0x00000000, 0x00ffffff, 0xc0284a20, 0x00000000, 0xb1000000, 0x00204411, 0x00000000, 0x00000001,
++    0x00204811, 0x00000000, 0x00000001, 0x00204811, 0x00000000, 0x00000001, 0x00204811, 0x00000000,
++    0x00000001, 0x00204811, 0x00000000, 0x00000001, 0x00204811, 0x00000000, 0x00000001, 0x00404811,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0xb1000000, 0x00204411, 0x00000000, 0x00000000,
++    0x00204811, 0x00000000, 0x00000000, 0x00204811, 0x00000000, 0x00000000, 0x00204811, 0x00000000,
++    0x00000000, 0x00204811, 0x00000000, 0x00000000, 0x00204811, 0x00000000, 0x00000000, 0x00404811,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0xc0200c00, 0x00000000, 0x00000000,
++    0xc0201000, 0x00000000, 0x00000000, 0xc0201400, 0x00000000, 0x00000000, 0xc0601800, 0x0000012e,
++    0x00000000, 0x002f0222, 0x00000000, 0x00000000, 0x0ae00000, 0x000001da, 0x00000008, 0x00210a23,
++    0x00000000, 0x00000000, 0x14e00000, 0x000000f5, 0x00000000, 0xc0204400, 0x00000000, 0x00000000,
++    0xc0404800, 0x00000000, 0x00000000, 0xc0200c00, 0x00000000, 0x00000000, 0xc0201000, 0x00000000,
++    0x00000000, 0xc0201400, 0x00000000, 0x00000000, 0xc0201800, 0x00000000, 0x00000000, 0xc0201c00,
++    0x00000000, 0x00000000, 0x00600000, 0x0000012e, 0x00000000, 0x002f0222, 0x00000000, 0x00000000,
++    0x0ce00000, 0x00000000, 0x00000000, 0x00204c07, 0x00000000, 0x00000000, 0x17000000, 0x00000000,
++    0x00000000, 0x00400000, 0x00000128, 0x00000005, 0x00210223, 0x00000000, 0x00000000, 0x14e00000,
++    0x00000134, 0x00000004, 0x00210223, 0x00000000, 0x00000000, 0x14e00000, 0x00000138, 0x00280000,
++    0x00295a24, 0x00000000, 0x00000000, 0x00402014, 0x0000013c, 0x0000003f, 0x00281224, 0x00000000,
++    0x0000002f, 0x002c1224, 0x00000000, 0x00000010, 0x00301224, 0x00000000, 0x00000000, 0x0040208d,
++    0x0000013c, 0x0001020a, 0x00204411, 0x00000000, 0x00000000, 0x00204804, 0x00000000, 0x00000001,
++    0x00204811, 0x00000000, 0x00000000, 0x00202013, 0x00000000, 0x00000000, 0x002820c8, 0x00000000,
++    0x00000003, 0x00210223, 0x00000000, 0x00000000, 0x14c00000, 0x00000142, 0x00000000, 0x00331505,
++    0x00000000, 0x80000000, 0x00202011, 0x00000000, 0x00000000, 0x003014a8, 0x00000000, 0x00000007,
++    0x00280a23, 0x00000000, 0x00000001, 0x002f0222, 0x00000000, 0x00000000, 0x0ae00000, 0x00000148,
++    0x00000000, 0x002f00a8, 0x00000000, 0x00000000, 0x04e00000, 0x00000161, 0x00000000, 0x00400000,
++    0x00000162, 0x00000002, 0x002f0222, 0x00000000, 0x00000000, 0x0ae00000, 0x0000014d, 0x00000000,
++    0x002f00a8, 0x00000000, 0x00000000, 0x02e00000, 0x00000161, 0x00000000, 0x00400000, 0x00000162,
++    0x00000003, 0x002f0222, 0x00000000, 0x00000000, 0x0ae00000, 0x00000152, 0x00000000, 0x002f00a8,
++    0x00000000, 0x00000000, 0x0ce00000, 0x00000161, 0x00000000, 0x00400000, 0x00000162, 0x00000004,
++    0x002f0222, 0x00000000, 0x00000000, 0x0ae00000, 0x00000157, 0x00000000, 0x002f00a8, 0x00000000,
++    0x00000000, 0x0ae00000, 0x00000161, 0x00000000, 0x00400000, 0x00000162, 0x00000005, 0x002f0222,
++    0x00000000, 0x00000000, 0x0ae00000, 0x0000015c, 0x00000000, 0x002f00a8, 0x00000000, 0x00000000,
++    0x06e00000, 0x00000161, 0x00000000, 0x00400000, 0x00000162, 0x00000006, 0x002f0222, 0x00000000,
++    0x00000000, 0x0ae00000, 0x00000161, 0x00000000, 0x002f00a8, 0x00000000, 0x00000000, 0x08e00000,
++    0x00000161, 0x00000000, 0x00400000, 0x00000162, 0x00000000, 0x00800811, 0x00000000, 0x00000001,
++    0x00800811, 0x00000000, 0x00000000, 0xc0200800, 0x00000000, 0x00000000, 0xc0200c00, 0x00000000,
++    0x00080000, 0x40281220, 0x00000000, 0x00000000, 0x002f0224, 0x00000000, 0x00000000, 0x0ae00000,
++    0x0000016b, 0x00007fff, 0xc0282620, 0x00000000, 0x00280000, 0x00295a29, 0x00000000, 0x00000000,
++    0x00500e83, 0x00000173, 0x0000003f, 0xc0282620, 0x00000000, 0x0000002f, 0x002c2629, 0x00000000,
++    0x00000010, 0x00302629, 0x00000000, 0x00000000, 0x0020112d, 0x00000000, 0x00000000, 0x00500c83,
++    0x00000173, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0xc0200800, 0x00000000, 0x00000000,
++    0xc0200c00, 0x00000000, 0x0003ffff, 0x00682622, 0x000002c5, 0x00000012, 0x00211222, 0x00000000,
++    0x00000fff, 0x00281224, 0x00000000, 0x00000001, 0x002d1224, 0x00000000, 0x0000001e, 0x00210222,
++    0x00000000, 0x00000000, 0x14c00000, 0x0000017d, 0x00800000, 0x00292629, 0x00000000, 0x00000001,
++    0x00281624, 0x00000000, 0x00000000, 0x003010a4, 0x00000000, 0xfffffff8, 0x00280e23, 0x00000000,
++    0xe1000000, 0x00205811, 0x00000000, 0x00000000, 0x00204804, 0x00000000, 0x00280000, 0x00295a29,
++    0x00000000, 0x0000001f, 0x00210222, 0x00000000, 0x00000000, 0x14e00000, 0x00000189, 0x0001020c,
++    0x00204411, 0x00000000, 0x00000000, 0x00204803, 0x00000000, 0x0001820d, 0x00204411, 0x00000000,
++    0x00000000, 0x00204814, 0x00000000, 0x00000001, 0x00331224, 0x00000000, 0x00000000, 0x0ae00000,
++    0x00000185, 0x00000000, 0x00400000, 0x00000000, 0x0001020a, 0x00204411, 0x00000000, 0x00000000,
++    0x00204803, 0x00000000, 0x00000000, 0x00204804, 0x00000000, 0x0001020c, 0x00204411, 0x00000000,
++    0x00000000, 0x00204803, 0x00000000, 0x0001820d, 0x00204411, 0x00000000, 0x0000001e, 0x00210222,
++    0x00000000, 0x00000000, 0x14c00000, 0x00000197, 0x00000001, 0x00211224, 0x00000000, 0x00000000,
++    0x00304a74, 0x00000000, 0x00000000, 0x00364a74, 0x00000000, 0x00000001, 0x00331224, 0x00000000,
++    0x00000000, 0x0ae00000, 0x00000192, 0x00000000, 0x00400000, 0x00000000, 0x00000000, 0x00304a74,
++    0x00000000, 0x00000001, 0x00331224, 0x00000000, 0x00000000, 0x0ae00000, 0x00000197, 0x00000000,
++    0x00400000, 0x00000000, 0x00008000, 0x40280a20, 0x00000000, 0x00007fff, 0x40282620, 0x00000000,
++    0x00000010, 0xc0210e20, 0x00000000, 0x0000000f, 0x00211223, 0x00000000, 0x00004000, 0x00281623,
++    0x00000000, 0x0000000d, 0x00211625, 0x00000000, 0x00003fff, 0x00280e23, 0x00000000, 0x00000001,
++    0x002d0e23, 0x00000000, 0x00000000, 0x002f0224, 0x00000000, 0x00000000, 0x0ce00000, 0x000001a6,
++    0x00000000, 0x00600000, 0x000002d6, 0x0001020a, 0x00204411, 0x00000000, 0x00000000, 0xc0204800,
++    0x00000000, 0x00000000, 0x00604803, 0x000002cb, 0x00000000, 0x00294522, 0x00000000, 0x00000001,
++    0x00330e23, 0x00000000, 0x00000000, 0x002248b3, 0x00001000, 0x00000000, 0x08e00000, 0x000021ab,
++    0x00000001, 0x00330e23, 0x00000000, 0x00000000, 0x00400000, 0x00000000, 0x00000000, 0xc0200800,
++    0x00000000, 0x0000001e, 0x00210222, 0x00000000, 0x00000000, 0x14c00000, 0x000001b3, 0xc4000000,
++    0x00204411, 0x00000000, 0x0000001f, 0x00210222, 0x00000000, 0x00000000, 0x14c00000, 0x000001b6,
++    0x00000000, 0x00600000, 0x000002d6, 0x00000000, 0xc0200c00, 0x00000000, 0x0000001d, 0x00212a22,
++    0x00000000, 0x00000001, 0x00282a2a, 0x00000000, 0x00000001, 0x002225f1, 0x00000000, 0x00000010,
++    0x00222222, 0x00000000, 0x00000000, 0x00292128, 0x00000000, 0x00000001, 0x00242228, 0x00000000,
++    0x0001020a, 0x00204411, 0x00000000, 0x00000000, 0xc0204800, 0x00000000, 0x00000000, 0x18c00000,
++    0x000021bd, 0x00000001, 0x00304a2a, 0x00000000, 0x00000000, 0x00201411, 0x00000000, 0x00000000,
++    0x00201011, 0x00000000, 0x00000000, 0x00201c11, 0x00000000, 0x00000000, 0x00201813, 0x00000000,
++    0x00000000, 0x002f022a, 0x00000000, 0x00000000, 0x0ce00000, 0x000001c8, 0x00000000, 0x00201c13,
++    0x00000000, 0x00000011, 0x00210228, 0x00000000, 0x00000000, 0x14c00000, 0x000001cc, 0x00000000,
++    0x003310c4, 0x00000000, 0x00000000, 0x005714e5, 0x000001ce, 0x00000000, 0x003010c4, 0x00000000,
++    0x00000000, 0x003614e5, 0x00000000, 0x00000001, 0x00232228, 0x00000000, 0x00000000, 0x14c00000,
++    0x000001c3, 0x0001020c, 0x00204411, 0x00000000, 0x00000000, 0x00204803, 0x00000000, 0x0001820d,
++    0x00204411, 0x00000000, 0x00000000, 0x002f022a, 0x00000000, 0x00000000, 0x0ce00000, 0x00002000,
++    0x00000000, 0x00204804, 0x00000000, 0x00000000, 0x00404805, 0x00000000, 0x00010035, 0x00204411,
++    0x00000000, 0xe1000000, 0xc0280a20, 0x00000000, 0x00000010, 0x00414a22, 0x00000000, 0x00003fff,
++    0x002f022f, 0x00000000, 0x00000000, 0x0ce00000, 0x00000000, 0x00000000, 0x00400000, 0x000001dd,
++    0x00000000, 0xd9000000, 0x00000000, 0x00000000, 0x00400000, 0x00000000, 0x00000001, 0x00202c11,
++    0x00000000, 0x00000001, 0x00303e2f, 0x00000000, 0x00000000, 0xc0200800, 0x00000000, 0x00000000,
++    0x002f0222, 0x00000000, 0x00000000, 0x0ce00000, 0x000001e5, 0x00000000, 0x00400000, 0x000001dd,
++    0x00000000, 0x2ce00000, 0x000001e7, 0x00000000, 0x00600000, 0x00000246, 0xc3000000, 0x00204411,
++    0x00000000, 0x00000000, 0xc0200800, 0x00000000, 0x00000009, 0x00210222, 0x00000000, 0x00000000,
++    0x14c00000, 0x000001ec, 0x00000000, 0x00203011, 0x00000000, 0x00000000, 0x00210222, 0x00000000,
++    0x00000000, 0x14c00000, 0x000001ef, 0x00000000, 0xc0200000, 0x00000000, 0x00000001, 0x00210222,
++    0x00000000, 0x00000000, 0x14c00000, 0x000001f2, 0x00000000, 0xc0200000, 0x00000000, 0x00000002,
++    0x00210222, 0x00000000, 0x00000000, 0x14c00000, 0x000001fc, 0x00000000, 0xc0200000, 0x00000000,
++    0x00000000, 0xc0200000, 0x00000000, 0x00000000, 0xc0200000, 0x00000000, 0x00000000, 0xc0200000,
++    0x00000000, 0x00000000, 0xc0200000, 0x00000000, 0x00000000, 0xc0200000, 0x00000000, 0x00000000,
++    0xc0200000, 0x00000000, 0x00000000, 0xc0200000, 0x00000000, 0x00000004, 0x00210222, 0x00000000,
++    0x00000000, 0x14c00000, 0x00000207, 0xa3000000, 0x00204411, 0x00000000, 0x00000001, 0x00204811,
++    0x00000000, 0x00000001, 0xc0280e20, 0x00000000, 0xfffffffe, 0x00282e2b, 0x00000000, 0x00000000,
++    0x00292c6b, 0x00000000, 0x00010027, 0x00204411, 0x00000000, 0x0000000a, 0x00214a2c, 0x00000000,
++    0x00000000, 0x00203011, 0x00000000, 0x00000000, 0x00205411, 0x00000000, 0x00000005, 0x00210222,
++    0x00000000, 0x00000000, 0x14c00000, 0x0000020a, 0x00000000, 0xc0200000, 0x00000000, 0x00000006,
++    0x00210222, 0x00000000, 0x00000000, 0x14c00000, 0x0000020d, 0x00000000, 0xc0200000, 0x00000000,
++    0x00000007, 0x00210222, 0x00000000, 0x00000000, 0x14c00000, 0x00000214, 0xa4000000, 0x00204411,
++    0x00000000, 0x20000000, 0xc0280e20, 0x00000000, 0xdfffffff, 0x00282e2b, 0x00000000, 0x00000000,
++    0x00292c6b, 0x00000000, 0x00000000, 0x00204803, 0x00000000, 0x00000008, 0x00210222, 0x00000000,
++    0x00000000, 0x14c00000, 0x00000218, 0x00000000, 0xc0200000, 0x00000000, 0x00000000, 0xc0200000,
++    0x00000000, 0xa394a390, 0x00200c11, 0x00000000, 0x00000000, 0x00203623, 0x00000000, 0x00000001,
++    0x00203623, 0x00000000, 0x00000002, 0x00203623, 0x00000000, 0x00000003, 0x00203623, 0x00000000,
++    0x00000004, 0x00203623, 0x00000000, 0x00000005, 0x00203623, 0x00000000, 0xa36e0000, 0x00200c11,
++    0x00000000, 0x00000006, 0x00203623, 0x00000000, 0xa36f0000, 0x00200c11, 0x00000000, 0x00000007,
++    0x00203623, 0x00000000, 0xa376a374, 0x00200c11, 0x00000000, 0x00000008, 0x00203623, 0x00000000,
++    0xa37ca378, 0x00200c11, 0x00000000, 0x00000009, 0x00203623, 0x00000000, 0xa37da379, 0x00200c11,
++    0x00000000, 0x0000000a, 0x00203623, 0x00000000, 0xa37ea37a, 0x00200c11, 0x00000000, 0x0000000b,
++    0x00203623, 0x00000000, 0xa377a375, 0x00200c11, 0x00000000, 0x0000000c, 0x00203623, 0x00000000,
++    0xa37fa37b, 0x00200c11, 0x00000000, 0x0000000d, 0x00203623, 0x00000000, 0xa371a370, 0x00200c11,
++    0x00000000, 0x0000000e, 0x00203623, 0x00000000, 0xa373a372, 0x00200c11, 0x00000000, 0x0000000f,
++    0x00403623, 0x00000000, 0x00000012, 0x40211220, 0x00000000, 0x0003ffff, 0xc0682620, 0x000002c5,
++    0xe1000000, 0x00205811, 0x00000000, 0x00000000, 0x00204804, 0x00000000, 0x00280000, 0x00295a29,
++    0x00000000, 0x94000000, 0x00204411, 0x00000000, 0x00000000, 0xc0204800, 0x00000000, 0x95008000,
++    0x00204411, 0x00000000, 0x00000001, 0x00331224, 0x00000000, 0x00000000, 0x00204814, 0x00001000,
++    0x00000000, 0x0ae00000, 0x0000223c, 0x00000001, 0x00331224, 0x00000000, 0x00000000, 0x00400000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x0001020c, 0x00204411, 0x00000000, 0x00000001,
++    0xc0294a20, 0x00000000, 0x0001820d, 0x00404411, 0x0000000a, 0x00000000, 0x00600000, 0x00000246,
++    0x00000000, 0xc0400000, 0x00000000, 0x00000002, 0x00205011, 0x00000000, 0x000021d9, 0x0029462c,
++    0x00000000, 0x00000005, 0x00204811, 0x00000000, 0x00000000, 0x0021022b, 0x00000000, 0x00000000,
++    0x14e00000, 0x0000024c, 0xc2000100, 0x0029462c, 0x00000000, 0x00000010, 0x00222a2c, 0x00000000,
++    0x0000000a, 0x00223235, 0x00000000, 0xc2000100, 0x0029462c, 0x00000000, 0x00010027, 0x00204411,
++    0x00000000, 0x00000000, 0x0029294c, 0x00000000, 0x00000006, 0x00244a2a, 0x00000000, 0x00400000,
++    0x00893a2e, 0x00000000, 0xc1000000, 0x0029462c, 0x00000000, 0xffbfffff, 0x00883a2e, 0x00000000,
++    0x00000001, 0x00303e2f, 0x00000000, 0x00000000, 0xc0200800, 0x00000000, 0x00000000, 0x002f0222,
++    0x00000000, 0x00000000, 0x0ce00000, 0x0000025a, 0x00000000, 0xc0400000, 0x00000000, 0x00000000,
++    0xc0200800, 0x00000000, 0x00000000, 0x002f0222, 0x00000000, 0x00000000, 0x0ce00000, 0x0000025e,
++    0x20000000, 0x00280a2b, 0x00000000, 0xa4000000, 0x00204411, 0x00000000, 0x00000000, 0x00404802,
++    0x00000000, 0x00000000, 0x00600000, 0x00000246, 0x00000000, 0xc0200800, 0x00000000, 0x0001020a,
++    0x00204411, 0x00000000, 0x00000000, 0xc0204800, 0x00000000, 0x00000001, 0x00204811, 0x00000000,
++    0x000021c0, 0x0029462c, 0x00000000, 0x00000000, 0x00204802, 0x00000000, 0x00000000, 0x00204813,
++    0x00000000, 0x000104d2, 0x00204411, 0x00000000, 0x00000000, 0x00404811, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0xc0200c00, 0x00000000, 0x00000010, 0x00210e23, 0x00000000,
++    0x0000003f, 0x00280e23, 0x00000000, 0x00000001, 0x00303e2f, 0x00000000, 0x00000030, 0x002f0223,
++    0x00000000, 0x00000000, 0x04e00000, 0x00000272, 0x00000030, 0x00330e23, 0x00000000, 0x00000010,
++    0x00300a23, 0x00000000, 0x00000000, 0xc0203440, 0x00000000, 0x00000001, 0x00300e23, 0x00000000,
++    0x00000000, 0x002f022f, 0x00000000, 0x00000000, 0x0ae00000, 0x0000026f, 0x00000000, 0x00400000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0xc0201000, 0x00000000, 0x00008000,
++    0x00280a24, 0x00000000, 0x00007fff, 0x00682624, 0x000002cb, 0x00000000, 0x00294522, 0x00000000,
++    0x00000018, 0x00210a24, 0x00000000, 0x0000002f, 0x002c0a22, 0x00000000, 0x00000010, 0x00211224,
++    0x00000000, 0x0000003f, 0x00281224, 0x00000000, 0x00000030, 0x002f0224, 0x00000000, 0x00000000,
++    0x04e00000, 0x00000284, 0x00000030, 0x00331224, 0x00000000, 0x00000010, 0x00300e24, 0x00000000,
++    0x00000000, 0x00200c6d, 0x00000000, 0x00000000, 0x00204803, 0x00000000, 0x00000000, 0x002f0222,
++    0x00000000, 0x00000000, 0x0ce00000, 0x00000000, 0x00000001, 0x00301224, 0x00000000, 0x00000001,
++    0x00530a22, 0x00000281, 0x00000000, 0xc0201000, 0x00000000, 0x00007fff, 0x00682624, 0x000002c5,
++    0x00000018, 0x00210a24, 0x00000000, 0x0000002f, 0x002c0a22, 0x00000000, 0x00000010, 0x00211224,
++    0x00000000, 0x0000003f, 0x00281224, 0x00000000, 0xe1000000, 0x00205811, 0x00000000, 0x00000001,
++    0x00304a22, 0x00000000, 0x00280000, 0x00295a29, 0x00000000, 0x00000030, 0x002f0224, 0x00000000,
++    0x00000000, 0x04e00000, 0x00000297, 0x00000030, 0x00331224, 0x00000000, 0x00000010, 0x00300e24,
++    0x00000000, 0x00000000, 0x00201414, 0x00000000, 0x00000000, 0x00203465, 0x00000000, 0x00000000,
++    0x002f0222, 0x00000000, 0x00000000, 0x0ce00000, 0x00000000, 0x00000001, 0x00301224, 0x00000000,
++    0x00000001, 0x00530a22, 0x00000294, 0x00007fff, 0xc0280a20, 0x00000000, 0x00007fff, 0xc0280e20,
++    0x00000000, 0x00000000, 0xc0201000, 0x00000000, 0x00280000, 0x00295a22, 0x00000000, 0x00000000,
++    0x002f0234, 0x00000000, 0x00000000, 0x0ce00000, 0x00000000, 0x00280000, 0x00295a23, 0x00000000,
++    0x00000000, 0x002f0094, 0x00000000, 0x00000000, 0x0ce00000, 0x000002a1, 0x00000000, 0x00400000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0xc0200800, 0x00000000, 0x00000000,
++    0xc0200c00, 0x00000000, 0x00000000, 0xc0201400, 0x00000000, 0x0001020a, 0x00204411, 0x00000000,
++    0x00000000, 0x00204802, 0x00000000, 0x00000001, 0x00204811, 0x00000000, 0x00000000, 0x002f0233,
++    0x00000000, 0x00000000, 0x0ce00000, 0x00000000, 0x0001020a, 0x00204411, 0x00000000, 0x00000000,
++    0x00204803, 0x00000000, 0x00000001, 0x00204811, 0x00000000, 0x00000000, 0x002f00b3, 0x00000000,
++    0x00000000, 0x0ce00000, 0x000002ac, 0x00000000, 0x00400000, 0x00000000, 0x00000000, 0xc0200800,
++    0x00000000, 0x00000000, 0x002f0222, 0x00000000, 0x00000000, 0x0ae00000, 0x000002bf, 0x00000000,
++    0x00600000, 0x00000253, 0x00000000, 0x00600000, 0x00000246, 0xc3000000, 0x00204411, 0x00000000,
++    0x000104d2, 0x00204411, 0x00000000, 0x00000000, 0x00404811, 0x00000000, 0x00010045, 0x00204411,
++    0x00000000, 0x000000ff, 0x00204811, 0x00000000, 0x00010e01, 0x00204411, 0x00000000, 0x00000000,
++    0x00204811, 0x00000000, 0x000104d2, 0x00204411, 0x00000000, 0x00000000, 0x00404811, 0x00000000,
++    0x00002000, 0x002f0229, 0x00000000, 0x00000000, 0x04e00000, 0x000002ca, 0x00002400, 0x002f0229,
++    0x00000000, 0x00000000, 0x06e00000, 0x000002ca, 0x00000000, 0x00292589, 0x00000000, 0x00000000,
++    0x00800000, 0x00000000, 0x00002000, 0x002f0229, 0x00000000, 0x00000000, 0x04e00000, 0x000002d2,
++    0x00002400, 0x002f0229, 0x00000000, 0x00000000, 0x06e00000, 0x000002d2, 0x00000000, 0x2ce00000,
++    0x000002d1, 0x00000000, 0x00600000, 0x00000246, 0x00000000, 0x00292589, 0x00000000, 0x00000000,
++    0x00800000, 0x00000000, 0x00000020, 0x00204c11, 0x00000000, 0x00000000, 0x00200000, 0x00000000,
++    0x00000000, 0x17000000, 0x00000000, 0x002c020f, 0x00205811, 0x00000000, 0x00070000, 0x00282a34,
++    0x00000000, 0x00000000, 0x002f022a, 0x00000000, 0x00000000, 0x0ae00000, 0x000002d3, 0x00000000,
++    0x00800000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x000501dd, 0x004700e3, 0x00000000, 0x01060005, 0x00050111, 0x00000000, 0x00050005,
++    0x00050005, 0x00000000, 0x00050005, 0x00050005, 0x00000000, 0x007b0005, 0x00050005, 0x00000000,
++    0x00f90005, 0x00050043, 0x00000000, 0x000c000c, 0x002d0011, 0x00000000, 0x00e40005, 0x02600005,
++    0x00000000, 0x00b50098, 0x00b80005, 0x00000000, 0x00050005, 0x00050005, 0x00000000, 0x00050005,
++    0x00050005, 0x00000000, 0x00f50123, 0x00050171, 0x00000000, 0x00c001d7, 0x0005019b, 0x00000000,
++    0x01190005, 0x00050049, 0x00000000, 0x000501df, 0x0005028b, 0x00000000, 0x0279026b, 0x00050005,
++    0x00000000, 0x00050005, 0x00050005, 0x00000000, 0x00050005, 0x00050005, 0x00000000, 0x00050005,
++    0x00050241, 0x00000000, 0x00050005, 0x02550244, 0x00000000, 0x02b70005, 0x00050005, 0x00000000,
++    0x00050005, 0x00050005, 0x00000000, 0x00050005, 0x00050005, 0x00000000, 0x00050005, 0x00050005,
++    0x00000000, 0x02a9029e, 0x01af0163, 0x00000000, 0x02330097, 0x00050005, 0x00000000, 0x00050005,
++    0x00020005, 0x00000000, 0x00090005, 0x00050005, 0x00000000,
++};
+diff --git c/iokit/Kernel/arm/a4xx_regs.h w/iokit/Kernel/arm/a4xx_regs.h
+new file mode 100644
+index 0000000..04a5503
+--- /dev/null
++++ w/iokit/Kernel/arm/a4xx_regs.h
+@@ -0,0 +1,52 @@
++#ifndef _A4XX_REGS_H_
++#define _A4XX_REGS_H_
++
++#include <stdint.h>
++
++/* Adreno 405 (A4xx) Hardware Registers */
++#define REG_A4XX_RBBM_AHB_CTL0                  0x00000023
++#define REG_A4XX_RBBM_AHB_CTL1                  0x00000024
++#define REG_A4XX_RBBM_SP_HYST_CNT               0x00000021
++#define REG_A4XX_RBBM_WAIT_IDLE_CLOCKS_CTL      0x0000002b
++#define REG_A4XX_RBBM_INTERFACE_HANG_INT_CTL    0x0000002f
++#define REG_A4XX_RBBM_INT_0_MASK                0x00000037
++#define REG_A4XX_RBBM_RBBM_CTL                  0x0000003e
++#define REG_A4XX_RBBM_SP_REGFILE_SLEEP_CNTL_0   0x00000099
++#define REG_A4XX_RBBM_SP_REGFILE_SLEEP_CNTL_1   0x0000009a
++#define REG_A4XX_RBBM_PERFCTR_CTL               0x00000170
++#define REG_A4XX_RBBM_GPU_BUSY_MASKED           0x0000017a
++
++#define REG_A4XX_CP_RB_BASE                     0x00000200
++#define REG_A4XX_CP_RB_CNTL                     0x00000201
++#define REG_A4XX_CP_RB_RPTR                     0x00000204
++#define REG_A4XX_CP_RB_WPTR                     0x00000205
++#define REG_A4XX_CP_PFP_UCODE_ADDR              0x00000223
++#define REG_A4XX_CP_PFP_UCODE_DATA              0x00000224
++#define REG_A4XX_CP_ME_RAM_WADDR                0x00000225
++#define REG_A4XX_CP_ME_RAM_DATA                 0x00000227
++#define REG_A4XX_CP_ME_CNTL                     0x0000022d
++#define REG_A4XX_CP_DEBUG                       0x0000022e
++#define REG_A4XX_CP_PROTECT(i0)                 (0x00000240 + (i0))
++#define REG_A4XX_CP_PROTECT_CTRL                0x00000250
++#define REG_A4XX_CP_PERFCTR_CP_SEL_0            0x00000500
++
++#define REG_A4XX_RB_GMEM_BASE_ADDR              0x00000cc0
++#define REG_A4XX_UCHE_TRAP_BASE_LO              0x00000e83
++#define REG_A4XX_UCHE_TRAP_BASE_HI              0x00000e84
++#define REG_A4XX_VBIF_ROUND_ROBIN_QOS_ARB       0x00003049
++#define REG_AXXX_CP_SCRATCH_REG2                0x0000057a
++
++/* PM4 Packets & Opcodes */
++#define CP_TYPE0_PKT                            0x00000000
++#define CP_TYPE2_PKT                            0x80000000
++#define CP_TYPE3_PKT                            0xc0000000
++
++#define CP_ME_INIT                              72
++#define CP_WAIT_FOR_IDLE                        38
++#define CP_EVENT_WRITE                          70
++#define CP_INDIRECT_BUFFER_PFE                  63
++
++#define CACHE_FLUSH_TS                          4
++#define HLSQ_FLUSH                              7
++
++#endif /* _A4XX_REGS_H_ */
+diff --git c/iokit/Kernel/arm/hid/SweetHID.cpp w/iokit/Kernel/arm/hid/SweetHID.cpp
+index c806f9b..ed58db3 100644
+--- c/iokit/Kernel/arm/hid/SweetHID.cpp
++++ w/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -355,7 +355,7 @@ OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
+  * (_UIEventHIDTouchEdgeTypeForHIDEvent); without it there is no home or
+  * app-switcher gesture.
+  */
+-#define SWEET_TOUCH_EDGE_PX 48
++#define SWEET_TOUCH_EDGE_PX 160
+ class SweetHIDTouch : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDTouch);
+ public:
+@@ -439,14 +439,25 @@ SweetHIDTouch::start(IOService *provider)
+ 	fPanelH = video.v_height ? (uint32_t)video.v_height : 1920;
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = native ? (int)fPanelW : 1125;
+-	fLogicalH = native ? (int)fPanelH : 2436;
++	uint32_t arg_w = 0, arg_h = 0;
++	PE_parse_boot_argn("sweetfb_w", &arg_w, sizeof(arg_w));
++	PE_parse_boot_argn("sweetfb_h", &arg_h, sizeof(arg_h));
++	if (arg_w && arg_h) {
++		fLogicalW = arg_w;
++		fLogicalH = arg_h;
++	} else if (native) {
++		fLogicalW = (int)fPanelW;
++		fLogicalH = (int)fPanelH;
++	} else {
++		fLogicalW = 1242;
++		fLogicalH = 2208;
++	}
+ 	fOffX = (fLogicalW - (int)fPanelW) / 2;
+ 	fOffY = (fLogicalH - (int)fPanelH) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+-	setProperty("SurfaceHeight", (unsigned long long)(151 << 16), 32);
++	setProperty("SurfaceHeight", (unsigned long long)(122 << 16), 32);
+ 	gSweetTouch = this;
+ 	registerService();
+ 	IOLog("SWEET HID: touch registered (%ux%u -> %dx%d)\n", fPanelW, fPanelH, fLogicalW, fLogicalH);
+@@ -470,9 +481,23 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+-	/* Normalized coordinates: 0..65536 across panel. */
+-	IOFixed nx = (IOFixed)(((int64_t)x << 16) / pw);
+-	IOFixed ny = (IOFixed)(((int64_t)y << 16) / ph);
++	/* Normalized coordinates: 0..65536 across displayed canvas. */
++	int fit = 1;
++	PE_parse_boot_argn("sweetfb_fit", &fit, sizeof(fit));
++	IOFixed nx, ny;
++	if (fit && fLogicalH > 0 && ph > 0) {
++		uint32_t fit_w = (fLogicalW * ph) / fLogicalH;
++		if (fit_w > pw) fit_w = pw;
++		uint32_t off_x = (pw - fit_w) / 2;
++		int cx = x - (int)off_x;
++		if (cx < 0) cx = 0;
++		if (cx >= (int)fit_w) cx = fit_w - 1;
++		nx = (IOFixed)(((int64_t)cx << 16) / fit_w);
++		ny = (IOFixed)(((int64_t)y << 16) / ph);
++	} else {
++		nx = (IOFixed)(((int64_t)x << 16) / pw);
++		ny = (IOFixed)(((int64_t)y << 16) / ph);
++	}
+ 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
+ 	if (was == down && !moved) {
+ 		IOLockUnlock(fLock);
+diff --git c/iokit/KernelConfigTables.cpp w/iokit/KernelConfigTables.cpp
+index 92f3e26..f726882 100644
+--- c/iokit/KernelConfigTables.cpp
++++ w/iokit/KernelConfigTables.cpp
+@@ -82,6 +82,11 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
++    "   {"
++    "     'IOClass'         = SweetAdreno;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetAdreno;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+diff --git c/iokit/conf/files.arm64 w/iokit/conf/files.arm64
+index acc9ae0..8cfe9eb 100644
+--- c/iokit/conf/files.arm64
++++ w/iokit/conf/files.arm64
+@@ -15,6 +15,7 @@ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitc
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
++iokit/Kernel/arm/SweetAdreno.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
