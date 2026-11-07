@@ -1,0 +1,14 @@
+diff --git c/iokit/Kernel/arm/SweetCPU.cpp w/iokit/Kernel/arm/SweetCPU.cpp
+index 7d250b3..c7d9d4b 100644
+--- c/iokit/Kernel/arm/SweetCPU.cpp
++++ w/iokit/Kernel/arm/SweetCPU.cpp
+@@ -254,7 +254,8 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
+ {
+ 	const ml_topology_cpu_t *cpu = &ml_get_topology_info()->cpus[getCPUNumber()];
+ 	/* cpu_start() passes NULL,NULL: x20/x21 are set by LowResetVectorBase. */
+-	if (start_paddr != 0 || arg_paddr != 0 || cpu->phys_id == 0 ||
++	/* shamrock: MPIDR 0x000 is a real core (cluster 0, core 0), not an invalid id */
++	if (start_paddr != 0 || arg_paddr != 0 ||
+ 	    __atomic_load_n(&initialized, __ATOMIC_ACQUIRE) != 0) {
+ 		panic("SWEET CPU: cpu=%u unsupported restart", getCPUNumber());
+ 	}
