@@ -1,0 +1,43 @@
+From 32defcc6c05183c8b74e9445edd158844db8c09d Mon Sep 17 00:00:00 2001
+From: x <x@x>
+Date: Sat, 7 Nov 2026 23:13:49 +0300
+Subject: [PATCH] 0124: shamrock: dynamic canvas size from device-tree (iPhone
+ 8 Plus D21AP 1242x2208) and boot-args
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 19 ++++++++++++++++---
+ 1 file changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 4871388..c69d379 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -170,9 +170,22 @@ AppleCLCD::start(IOService *provider)
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
+-	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+-		fLogicalW = SWEET_FB_LOGICAL_W;
+-		fLogicalH = SWEET_FB_LOGICAL_H;
++	uint32_t arg_w = 0, arg_h = 0;
++	PE_parse_boot_argn("sweetfb_w", &arg_w, sizeof(arg_w));
++	PE_parse_boot_argn("sweetfb_h", &arg_h, sizeof(arg_h));
++	if (arg_w && arg_h) {
++		fLogicalW = arg_w;
++		fLogicalH = arg_h;
++	} else if (!native) {
++		OSNumber *numW = OSDynamicCast(OSNumber, provider->getProperty("canvas-width"));
++		OSNumber *numH = OSDynamicCast(OSNumber, provider->getProperty("canvas-height"));
++		if (numW != NULL && numH != NULL) {
++			fLogicalW = numW->unsigned32BitValue();
++			fLogicalH = numH->unsigned32BitValue();
++		} else if (fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
++			fLogicalW = SWEET_FB_LOGICAL_W;
++			fLogicalH = SWEET_FB_LOGICAL_H;
++		}
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+-- 
+2.55.0
+
