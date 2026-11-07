@@ -1,0 +1,79 @@
+diff --git c/bsd/dev/sweet_emmc.c w/bsd/dev/sweet_emmc.c
+index ce8429c..3dfc16f 100644
+--- c/bsd/dev/sweet_emmc.c
++++ w/bsd/dev/sweet_emmc.c
+@@ -47,6 +47,7 @@ static struct {
+ 	vm_offset_t dma;                   /* kernel VA of the DMA allocation (ADMA2 table + bounce) */
+ 	uint64_t dma_pa;
+ 	bool dma_ok;
++	uint64_t stat_bytes, stat_ticks, stat_next;   /* ADMA read throughput */
+ } se;
+ 
+ #define DMA_TABLE       0x0000          /* ADMA2 descriptors, 16 x 8 bytes used */
+@@ -558,7 +559,16 @@ sweet_emmc_strategy(buf_t bp)
+ 		if (is_read && se.dma_ok) {
+ 			uint32_t w = MIN(count - done, DMA_BYTES - skip);
+ 			uint32_t nsec = (skip + w + 511) / 512;
++			uint64_t ts = mach_absolute_time();
+ 			error = emmc_dma_read((uint32_t)(se.first_block + lba), nsec);
++			se.stat_ticks += mach_absolute_time() - ts;
++			se.stat_bytes += (uint64_t)nsec * 512;
++			if (se.stat_bytes >= se.stat_next) {
++				uint64_t us = se.stat_ticks * 10ULL / 192ULL;
++				printf("SWEET EMMC: %llu MiB read, %llu KiB/s avg while reading\n", se.stat_bytes >> 20,
++				    us ? (se.stat_bytes * 1000000ULL / us) >> 10 : 0);
++				se.stat_next = se.stat_bytes + (32ULL << 20);
++			}
+ 			if (error) {
+ 				/* DMA path failed: log once, fall back to PIO for good */
+ 				printf("SWEET EMMC: ADMA read failed (%d, int 0x%x), using PIO\n", error, last_int);
+diff --git c/osfmk/arm64/sweet_stall.c w/osfmk/arm64/sweet_stall.c
+index c312407..fa670bc 100644
+--- c/osfmk/arm64/sweet_stall.c
++++ w/osfmk/arm64/sweet_stall.c
+@@ -20,6 +20,7 @@
+ #include <sys/msgbuf.h>
+ 
+ #if defined(SWEET)
++extern int printf(const char *fmt, ...) __printflike(1, 2);
+ #define STALL_PA   0xbff40000ULL
+ #define STALL_SIZE 0x40000
+ #define STALL_WDT  0x0b017000ULL
+@@ -112,7 +113,7 @@ sweet_stall_fire(thread_call_param_t p0, thread_call_param_t p1)
+ 	/* tail of the kernel message buffer (printf/IOLog/hfs messages): msg_bufx is the write pointer of a ring */
+ 	if (msgbufp && msgbufp->msg_magic == MSG_MAGIC && msgbufp->msg_bufc && msgbufp->msg_size > 0) {
+ 		int size = msgbufp->msg_size;
+-		int n = size < 24576 ? size : 24576;
++		int n = size < 120000 ? size : 120000;
+ 		int x = msgbufp->msg_bufx;
+ 		s_s("MSGBUF\n");
+ 		for (int i = n; i > 0; i--) {
+@@ -147,10 +148,28 @@ sweet_stall_fire(thread_call_param_t p0, thread_call_param_t p1)
+ 	}
+ }
+ 
++/* CPU speed probe: a 3-instruction loop (add, subs, b.ne) timed with the 19.2 MHz architected counter.
++ * ~1 iteration per cycle on a Cortex-A53, so iterations/us is roughly the core clock in MHz. */
++static void
++sweet_cpu_bench(void)
++{
++	uint64_t n = 20000000ULL, x = 0;
++	uint64_t t0 = mach_absolute_time();
++	__asm__ volatile ("1: add %0, %0, #1\n\tsubs %1, %1, #1\n\tb.ne 1b" : "+r"(x), "+r"(n) : : "cc");
++	uint64_t dt = mach_absolute_time() - t0;
++	uint64_t us = dt * 10ULL / 192ULL;     /* 19.2 MHz ticks -> microseconds */
++	printf("SWEET BENCH: 20000000 loop iterations in %llu us (~%llu iterations/us)\n", us, us ? 20000000ULL / us : 0);
++}
++
+ void sweet_stall_arm(uint32_t seconds);
+ void
+ sweet_stall_arm(uint32_t seconds)
+ {
++	static bool benched;
++	if (!benched) {
++		benched = true;
++		sweet_cpu_bench();
++	}
+ 	static thread_call_t call;
+ 	uint64_t deadline;
+ 
