@@ -1,0 +1,162 @@
+diff --git c/bsd/dev/sweet_emmc.c w/bsd/dev/sweet_emmc.c
+index a611e1a..0982e9a 100644
+--- c/bsd/dev/sweet_emmc.c
++++ w/bsd/dev/sweet_emmc.c
+@@ -305,6 +305,74 @@ emmc_hw_init(void)
+ 	return 0;
+ }
+ 
++/* Single-block PIO write (CMD24), then wait for the card to leave the programming state. */
++static int
++write_data_cmd(uint32_t lba, const uint32_t *buf)
++{
++	uint64_t t0 = mach_absolute_time();
++	hw(0x2c, hr(0x2c) | (0x06u << 24));
++	while (((hr(0x2c) >> 24) & 6) && !timed_out(t0, 100000)) {
++	}
++	t0 = mach_absolute_time();
++	while (hr(0x24) & 3) {
++		if (timed_out(t0, 100000)) {
++			return -1;
++		}
++	}
++	hw(0x34, 0x0000ffff);
++	hw(0x30, 0xffffffff);
++	hw(0x04, (1u << 16) | 512 | (7 << 12));
++	hw(0x08, lba);
++	hw(0x0c, (((24u << 8) | 0x3a) << 16) | 0x0000);     /* write direction, no DMA */
++	t0 = mach_absolute_time();
++	for (;;) {
++		if (hr(0x30) & 0x8000) {
++			cmd_reset();
++			return -2;
++		}
++		if (hr(0x24) & 0x400) {                 /* buffer write enable */
++			break;
++		}
++		if (timed_out(t0, 500000)) {
++			cmd_reset();
++			return -3;
++		}
++	}
++	for (int i = 0; i < 128; i++) {
++		hw(0x20, buf[i]);
++	}
++	t0 = mach_absolute_time();
++	while (!(hr(0x30) & 2)) {
++		if (hr(0x30) & 0x8000) {
++			cmd_reset();
++			return -4;
++		}
++		if (timed_out(t0, 1000000)) {
++			cmd_reset();
++			return -5;
++		}
++	}
++	hw(0x30, 0xffffffff);
++	/* CMD13 until READY_FOR_DATA (bit 8) and state == tran (4) */
++	t0 = mach_absolute_time();
++	for (;;) {
++		uint32_t r = 0;
++		if (send_cmd(13, 1u << 16, 0x1a, &r) == 0 && (r & 0x100) && (((r >> 9) & 0xf) == 4)) {
++			break;
++		}
++		if (timed_out(t0, 2000000)) {
++			return -6;
++		}
++	}
++	return 0;
++}
++
++static int
++emmc_write_sectors(uint64_t lba, const void *src)
++{
++	return write_data_cmd((uint32_t)lba, (const uint32_t *)src) ? EIO : 0;
++}
++
+ static int
+ emmc_read_sectors(uint64_t lba, uint32_t count, void *dst)
+ {
+@@ -371,12 +439,12 @@ emmc_find_partition(const char *want)
+ }
+ 
+ static int
+-sweet_emmc_open(__unused dev_t dev, int flags, __unused int devtype, __unused struct proc *p)
++sweet_emmc_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
+ {
+ 	if (!se.ready) {
+ 		return ENXIO;
+ 	}
+-	return (flags & FWRITE) ? EROFS : 0;
++	return 0;
+ }
+ 
+ static int
+@@ -396,10 +464,7 @@ sweet_emmc_strategy(buf_t bp)
+ 	static uint32_t bounce[128];
+ 
+ 	buf_setresid(bp, count);
+-	if (!(buf_flags(bp) & B_READ)) {
+-		error = EROFS;
+-		goto done;
+-	}
++	bool is_read = (buf_flags(bp) & B_READ) != 0;
+ 	if (off > part_bytes || count > part_bytes - off) {
+ 		error = EINVAL;
+ 		goto done;
+@@ -417,12 +482,22 @@ sweet_emmc_strategy(buf_t bp)
+ 		uint64_t lba = pos / 512;
+ 		uint32_t skip = (uint32_t)(pos % 512);
+ 		uint32_t want = MIN(count - done, 512 - skip);
+-		if (skip == 0 && want == 512) {
+-			error = emmc_read_sectors(se.first_block + lba, 1, vaddr + done);
++		if (is_read) {
++			if (skip == 0 && want == 512) {
++				error = emmc_read_sectors(se.first_block + lba, 1, vaddr + done);
++			} else {
++				error = emmc_read_sectors(se.first_block + lba, 1, bounce);
++				if (!error) {
++					memcpy(vaddr + done, (char *)bounce + skip, want);
++				}
++			}
++		} else if (skip == 0 && want == 512) {
++			error = emmc_write_sectors(se.first_block + lba, vaddr + done);
+ 		} else {
+ 			error = emmc_read_sectors(se.first_block + lba, 1, bounce);
+ 			if (!error) {
+-				memcpy(vaddr + done, (char *)bounce + skip, want);
++				memcpy((char *)bounce + skip, vaddr + done, want);
++				error = emmc_write_sectors(se.first_block + lba, bounce);
+ 			}
+ 		}
+ 		if (error) {
+@@ -462,7 +537,7 @@ sweet_emmc_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag
+ 		*(uint64_t *)data = 1;
+ 		return 0;
+ 	case DKIOCGETMAXBLOCKCOUNTWRITE:
+-		*(uint64_t *)data = 0;
++		*(uint64_t *)data = 1;
+ 		return 0;
+ 	case DKIOCGETMAXSEGMENTCOUNTREAD:
+ 	case DKIOCGETMAXSEGMENTCOUNTWRITE:
+@@ -472,7 +547,7 @@ sweet_emmc_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag
+ 	case DKIOCSYNCHRONIZECACHE:
+ 		return 0;
+ 	case DKIOCISWRITABLE:
+-		*(uint32_t *)data = 0;
++		*(uint32_t *)data = 1;
+ 		return 0;
+ 	case DKIOCGETPHYSICALBLOCKSIZE:
+ 		*(uint32_t *)data = 512;
+@@ -495,9 +570,9 @@ sweet_emmc_read(dev_t dev, struct uio *uio, __unused int ioflag)
+ }
+ 
+ static int
+-sweet_emmc_write(__unused dev_t dev, __unused struct uio *uio, __unused int ioflag)
++sweet_emmc_write(dev_t dev, struct uio *uio, __unused int ioflag)
+ {
+-	return EROFS;
++	return physio(sweet_emmc_strategy, NULL, dev, B_WRITE, minphys, uio, 512);
+ }
+ 
+ static const struct bdevsw sweet_emmc_bdevsw = {
