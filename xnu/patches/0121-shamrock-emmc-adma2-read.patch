@@ -1,0 +1,155 @@
+diff --git c/bsd/dev/sweet_emmc.c w/bsd/dev/sweet_emmc.c
+index 0982e9a..ce8429c 100644
+--- c/bsd/dev/sweet_emmc.c
++++ w/bsd/dev/sweet_emmc.c
+@@ -20,10 +20,14 @@
+ #include <kern/locks.h>
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
+ #include <pexpert/pexpert.h>
+ #include <libkern/libkern.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ 
+ #define SDC1_BASE   0x07824000UL
+ #define SDC1_SIZE   0x1000UL
+@@ -40,8 +44,16 @@ static struct {
+ 	dev_t bdev;
+ 	uint64_t first_block, nblocks;     /* partition, in 512-byte sectors */
+ 	uint64_t total_sectors;
++	vm_offset_t dma;                   /* kernel VA of the DMA allocation (ADMA2 table + bounce) */
++	uint64_t dma_pa;
++	bool dma_ok;
+ } se;
+ 
++#define DMA_TABLE       0x0000          /* ADMA2 descriptors, 16 x 8 bytes used */
++#define DMA_BOUNCE      0x4000
++#define DMA_BYTES       (1u << 20)      /* bounce size: 2048 sectors */
++#define DMA_ALLOC       (DMA_BOUNCE + DMA_BYTES)
++
+ /* init log kept in RAM; on failure it is copied to 0xbff40000 (SWEETDUMP format) and the SoC is reset by the watchdog so lk2nd can read it */
+ static char elog[3072];
+ static unsigned elog_len;
+@@ -373,6 +385,67 @@ emmc_write_sectors(uint64_t lba, const void *src)
+ 	return write_data_cmd((uint32_t)lba, (const uint32_t *)src) ? EIO : 0;
+ }
+ 
++/* Multi-block read (CMD18) with ADMA2 into the bounce buffer; count <= DMA_BYTES / 512. */
++static int
++emmc_dma_read(uint32_t lba, uint32_t count)
++{
++	struct { uint16_t attr; uint16_t len; uint32_t addr; } *d = (void *)(se.dma + DMA_TABLE);
++	uint32_t bytes = count * 512, n = 0, off = 0;
++	uint64_t t0;
++
++	while (off < bytes) {
++		uint32_t l = MIN(bytes - off, 0x10000u);
++		d[n].attr = 0x21;               /* valid, act = tran */
++		d[n].len = (uint16_t)l;         /* 0 means 64 KiB */
++		d[n].addr = (uint32_t)(se.dma_pa + DMA_BOUNCE + off);
++		off += l;
++		n++;
++	}
++	d[n - 1].attr = 0x23;                   /* valid, end, tran */
++	flush_dcache64((addr64_t)(se.dma_pa + DMA_TABLE), n * 8, TRUE);
++	flush_dcache64((addr64_t)(se.dma_pa + DMA_BOUNCE), bytes, TRUE);
++
++	t0 = mach_absolute_time();
++	hw(0x2c, hr(0x2c) | (0x06u << 24));
++	while (((hr(0x2c) >> 24) & 6) && !timed_out(t0, 100000)) {
++	}
++	t0 = mach_absolute_time();
++	while (hr(0x24) & 3) {
++		if (timed_out(t0, 100000)) {
++			return -1;
++		}
++	}
++	hw(0x34, 0x0000ffff);
++	hw(0x30, 0xffffffff);
++	hw(0x28, (hr(0x28) & ~0x18u) | 0x10);   /* DMA select: ADMA2 32-bit */
++	hw(0x58, (uint32_t)(se.dma_pa + DMA_TABLE));
++	hw(0x5c, (uint32_t)((se.dma_pa + DMA_TABLE) >> 32));
++	hw(0x04, (count << 16) | 512 | (7 << 12));
++	hw(0x08, lba);
++	/* CMD18, R1; transfer mode: DMA | block count | auto CMD12 | read | multi block */
++	hw(0x0c, (((18u << 8) | 0x3a) << 16) | 0x0037);
++	t0 = mach_absolute_time();
++	for (;;) {
++		uint32_t st = hr(0x30);
++		if (st & 0x8000) {
++			last_int = st;
++			cmd_reset();
++			return -2;
++		}
++		if (st & 2) {
++			break;
++		}
++		if (timed_out(t0, 3000000)) {
++			last_int = st;
++			cmd_reset();
++			return -3;
++		}
++	}
++	hw(0x30, 0xffffffff);
++	flush_dcache64((addr64_t)(se.dma_pa + DMA_BOUNCE), bytes, TRUE);
++	return 0;
++}
++
+ static int
+ emmc_read_sectors(uint64_t lba, uint32_t count, void *dst)
+ {
+@@ -482,6 +555,22 @@ sweet_emmc_strategy(buf_t bp)
+ 		uint64_t lba = pos / 512;
+ 		uint32_t skip = (uint32_t)(pos % 512);
+ 		uint32_t want = MIN(count - done, 512 - skip);
++		if (is_read && se.dma_ok) {
++			uint32_t w = MIN(count - done, DMA_BYTES - skip);
++			uint32_t nsec = (skip + w + 511) / 512;
++			error = emmc_dma_read((uint32_t)(se.first_block + lba), nsec);
++			if (error) {
++				/* DMA path failed: log once, fall back to PIO for good */
++				printf("SWEET EMMC: ADMA read failed (%d, int 0x%x), using PIO\n", error, last_int);
++				se.dma_ok = false;
++				error = 0;
++				continue;
++			}
++			memcpy(vaddr + done, (char *)(se.dma + DMA_BOUNCE) + skip, w);
++			done += w;
++			buf_setresid(bp, count - done);
++			continue;
++		}
+ 		if (is_read) {
+ 			if (skip == 0 && want == 512) {
+ 				error = emmc_read_sectors(se.first_block + lba, 1, vaddr + done);
+@@ -614,6 +703,16 @@ sweet_emmc_init(void)
+ 		return ENOMEM;
+ 	}
+ 	se.hc = se.core + HC_OFF;
++	if (kmem_alloc_contig(kernel_map, &se.dma, DMA_ALLOC, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)se.dma);
++		uint32_t nodma = 0;
++		PE_parse_boot_argn("emmcnodma", &nodma, sizeof(nodma));
++		if (pn && !nodma) {
++			se.dma_pa = ptoa_64(pn);
++			se.dma_ok = true;
++		}
++	}
+ 	lck_mtx_lock(&sweet_emmc_lock);
+ 	error = emmc_hw_init();
+ 	if (!error) {
+@@ -637,8 +736,8 @@ sweet_emmc_init(void)
+ 	devfs_make_node(se.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640, "emmcroot0");
+ 	devfs_make_node(makedev(se.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR, 0640, "remmcroot0");
+ 	se.ready = true;
+-	printf("SWEET EMMC: \"%s\": first sector 0x%llx, %llu MiB, read-only\n", want, se.first_block,
+-	    se.nblocks * 512 >> 20);
++	printf("SWEET EMMC: \"%s\": first sector 0x%llx, %llu MiB, %s\n", want, se.first_block,
++	    se.nblocks * 512 >> 20, se.dma_ok ? "ADMA2 read" : "PIO");
+ 	return 0;
+ }
+ 
