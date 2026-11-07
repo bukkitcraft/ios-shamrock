@@ -1,9 +1,9 @@
 diff --git c/iokit/Kernel/arm/SweetAdreno.cpp i/iokit/Kernel/arm/SweetAdreno.cpp
 new file mode 100644
-index 0000000..7d07a10
+index 0000000..e4d7b0b
 --- /dev/null
 +++ i/iokit/Kernel/arm/SweetAdreno.cpp
-@@ -0,0 +1,708 @@
+@@ -0,0 +1,715 @@
 +/*
 + * SweetAdreno.cpp: Qualcomm Adreno 405 (A4xx) GPU driver and HakiosGPU service for MSM8952.
 + */
@@ -682,6 +682,13 @@ index 0000000..7d07a10
 +SweetAdreno::start(IOService *provider)
 +{
 +	if (!IOService::start(provider)) return false;
++
++	int gpu_enabled = 0;
++	PE_parse_boot_argn("sweetgpu", &gpu_enabled, sizeof(gpu_enabled));
++	if (!gpu_enabled) {
++		IOLog("SWEET A405: disabled (pass sweetgpu=1 in boot-args to enable)\n");
++		return false;
++	}
 +
 +	IOLog("SWEET A405: initializing Qualcomm Adreno 405...\n");
 +
