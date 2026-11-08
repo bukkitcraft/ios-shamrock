@@ -1,0 +1,320 @@
+diff --git c/iokit/Kernel/arm/HakiosGPU.cpp i/iokit/Kernel/arm/HakiosGPU.cpp
+index 197e4cd..de4c435 100644
+--- c/iokit/Kernel/arm/HakiosGPU.cpp
++++ i/iokit/Kernel/arm/HakiosGPU.cpp
+@@ -792,23 +792,43 @@ HakiosGPUUserClient::gemNew(struct msm_gem_new * request)
+ 		}
+ 	}
+ 	IOLockUnlock(gGPULock);
+-	/* (the memory comes zeroed, and making it write-combined pushes the zeroes out of the cache) */
+-	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
+-	    kIOMemoryPhysicallyContiguous | (gGPUCached ? 0 : kIOMapWriteCombineCache), (vm_size_t) size, PAGE_SIZE);
++	/*
++	 * shamrock: a large buffer (a texture, a render target) comes from the contiguous, write-combined
++	 * GPU buffer pool (SweetSurface.cpp) first: a run of that many contiguous pages is rarely there once userland is up, and looking
++	 * for one costs some 15 ms (vm_page_find_contiguous). A small one tries the VM first.
++	 */
++	uint8_t * kernel = NULL;
++	uint64_t phys = 0;
++	memory = NULL;
++	if (size >= (512u << 10)) {
++		memory = sweet_pool_buffer(size, &kernel, &phys);
++	}
++	if (memory == NULL) {
++		/* (the memory comes zeroed, and making it write-combined pushes the zeroes out of the cache) */
++		memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
++		    kIOMemoryPhysicallyContiguous | (gGPUCached ? 0 : kIOMapWriteCombineCache), (vm_size_t) size, PAGE_SIZE);
++		if (memory != NULL) {
++			kernel = (uint8_t *) memory->getBytesNoCopy();
++			if (gGPUCached) {
++				hakios_gpu_to_memory(kernel, size);
++			}
++		}
++	}
++	if (memory == NULL && size < (512u << 10)) {
++		memory = sweet_pool_buffer(size, &kernel, &phys);
++	}
+ 	if (memory == NULL) {
+ 		IOLog("HakiosGPU: no memory for a buffer of %llu bytes (%u buffers, %llu MB with this client)\n", size, fBufferCount,
+ 		    fBufferBytes >> 20);
+ 		return kIOReturnNoMemory;
+ 	}
+-	if (gGPUCached) {
+-		hakios_gpu_to_memory(memory->getBytesNoCopy(), size);
+-	}
++	(void) phys;                                    /* (newBuffer() finds it again, and checks it) */
+ 
+ 	IOLockLock(gGPULock);
+ 	b = newBuffer(memory, 0, size, request->flags, &request->handle);
+ 	if (b != NULL) {
+ 		b->memory = memory;
+-		b->kernel = (uint8_t *) memory->getBytesNoCopy();
++		b->kernel = kernel;
+ 		gGPUStat.made++;
+ 		gGPUStat.making += mach_absolute_time() - began;
+ 	}
+diff --git c/iokit/Kernel/arm/SweetSurface.cpp i/iokit/Kernel/arm/SweetSurface.cpp
+index 32495c0..d1eb1cc 100644
+--- c/iokit/Kernel/arm/SweetSurface.cpp
++++ i/iokit/Kernel/arm/SweetSurface.cpp
+@@ -90,92 +90,178 @@ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+  */
+ #define SWEET_POOL_MIN          (512u << 10)
+ #define SWEET_POOL_BLOCKS       128
+-static IOBufferMemoryDescriptor *sweet_pool;
+-static uint64_t sweet_pool_bytes;
+-static IOLock *sweet_pool_lock;
+-static struct { uint64_t off, size; bool used; } sweet_pool_blk[SWEET_POOL_BLOCKS];
+-static uint32_t sweet_pool_nblk;
++struct sweet_pool_t {
++	IOBufferMemoryDescriptor *mem;
++	uint64_t bytes, phys;
++	uint8_t *kernel;
++	IOLock *lock;
++	struct { uint64_t off, size; bool used; } blk[SWEET_POOL_BLOCKS];
++	uint32_t nblk;
++};
++static struct sweet_pool_t sweet_surf_pool;     /* cached: surfaces (their seeds push the caches, HakiosGPU.cpp) */
++static struct sweet_pool_t sweet_gpu_pool;      /* write-combined: HakiosGPU's own buffers, as the VM's would be */
++#define sweet_pool (sweet_surf_pool.mem)
++
++static void
++sweet_pool_setup(struct sweet_pool_t *pool, const char *what, const char *arg, uint32_t mb, IOOptionBits cache)
++{
++	PE_parse_boot_argn(arg, &mb, sizeof(mb));
++	for (; mb >= 16 && pool->mem == NULL; mb = mb * 3 / 4) {
++		pool->mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous | cache, (vm_size_t)mb << 20, page_size);
++		if (pool->mem != NULL) {
++			pool->bytes = (uint64_t)mb << 20;
++		}
++	}
++	if (pool->mem == NULL) {
++		IOLog("SWEET SURF: no contiguous %s pool (the GPU cannot use large buffers)\n", what);
++		return;
++	}
++	pool->lock = IOLockAlloc();
++	pool->kernel = (uint8_t *)pool->mem->getBytesNoCopy();
++	pool->phys = (uint64_t)pool->mem->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++	pool->blk[0].off = 0;
++	pool->blk[0].size = pool->bytes;
++	pool->blk[0].used = false;
++	pool->nblk = 1;
++	IOLog("SWEET SURF: contiguous %s pool %llu MB at phys 0x%llx\n", what, pool->bytes >> 20, pool->phys);
++}
+ 
+ static void
+ sweet_pool_init(void)
+ {
+-	uint32_t mb = 96;
++	sweet_pool_setup(&sweet_surf_pool, "surface", "sweetsurfpool", 96, 0);
++	sweet_pool_setup(&sweet_gpu_pool, "GPU buffer", "sweetgpupool", 64, kIOMapWriteCombineCache);
++}
+ 
+-	PE_parse_boot_argn("sweetsurfpool", &mb, sizeof(mb));
+-	for (; mb >= 16 && sweet_pool == NULL; mb = mb * 3 / 4) {
+-		sweet_pool = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, (vm_size_t)mb << 20, page_size);
+-		if (sweet_pool != NULL) {
+-			sweet_pool_bytes = (uint64_t)mb << 20;
++static bool
++sweet_pool_alloc_in(struct sweet_pool_t *pool, uint64_t want, uint64_t *off, uint64_t *size)
++{
++	bool ok = false;
++
++	if (pool->mem == NULL) {
++		return false;
++	}
++	want = round_page_64(want);
++	IOLockLock(pool->lock);
++	for (uint32_t i = 0; i < pool->nblk; i++) {
++		if (pool->blk[i].used || pool->blk[i].size < want) {
++			continue;
+ 		}
++		if (pool->blk[i].size > want) {
++			if (pool->nblk >= SWEET_POOL_BLOCKS) {
++				break;
++			}
++			memmove(&pool->blk[i + 2], &pool->blk[i + 1], (pool->nblk - i - 1) * sizeof(pool->blk[0]));
++			pool->blk[i + 1].off = pool->blk[i].off + want;
++			pool->blk[i + 1].size = pool->blk[i].size - want;
++			pool->blk[i + 1].used = false;
++			pool->blk[i].size = want;
++			pool->nblk++;
++		}
++		pool->blk[i].used = true;
++		*off = pool->blk[i].off;
++		*size = want;
++		ok = true;
++		break;
+ 	}
+-	if (sweet_pool == NULL) {
+-		IOLog("SWEET SURF: no contiguous surface pool (GPU cannot draw into large surfaces)\n");
+-		return;
++	IOLockUnlock(pool->lock);
++	return ok;
++}
++
++static void
++sweet_pool_free_in(struct sweet_pool_t *pool, uint64_t off)
++{
++	IOLockLock(pool->lock);
++	for (uint32_t i = 0; i < pool->nblk; i++) {
++		if (pool->blk[i].off != off || !pool->blk[i].used) {
++			continue;
++		}
++		pool->blk[i].used = false;
++		if (i + 1 < pool->nblk && !pool->blk[i + 1].used) {
++			pool->blk[i].size += pool->blk[i + 1].size;
++			memmove(&pool->blk[i + 1], &pool->blk[i + 2], (pool->nblk - i - 2) * sizeof(pool->blk[0]));
++			pool->nblk--;
++		}
++		if (i > 0 && !pool->blk[i - 1].used) {
++			pool->blk[i - 1].size += pool->blk[i].size;
++			memmove(&pool->blk[i], &pool->blk[i + 1], (pool->nblk - i - 1) * sizeof(pool->blk[0]));
++			pool->nblk--;
++		}
++		break;
+ 	}
+-	sweet_pool_lock = IOLockAlloc();
+-	sweet_pool_blk[0].off = 0;
+-	sweet_pool_blk[0].size = sweet_pool_bytes;
+-	sweet_pool_blk[0].used = false;
+-	sweet_pool_nblk = 1;
+-	IOLog("SWEET SURF: contiguous surface pool %llu MB at phys 0x%llx\n", sweet_pool_bytes >> 20,
+-	    (uint64_t)sweet_pool->getPhysicalSegment(0, NULL, kIOMemoryMapperNone));
++	IOLockUnlock(pool->lock);
+ }
+ 
+ static bool
+ sweet_pool_alloc(uint64_t want, uint64_t *off, uint64_t *size)
+ {
+-	bool ok = false;
+-
+-	want = round_page_64(want);
+-	IOLockLock(sweet_pool_lock);
+-	for (uint32_t i = 0; i < sweet_pool_nblk; i++) {
+-		if (sweet_pool_blk[i].used || sweet_pool_blk[i].size < want) {
+-			continue;
+-		}
+-		if (sweet_pool_blk[i].size > want) {
+-			if (sweet_pool_nblk >= SWEET_POOL_BLOCKS) {
+-				break;
+-			}
+-			memmove(&sweet_pool_blk[i + 2], &sweet_pool_blk[i + 1], (sweet_pool_nblk - i - 1) * sizeof(sweet_pool_blk[0]));
+-			sweet_pool_blk[i + 1].off = sweet_pool_blk[i].off + want;
+-			sweet_pool_blk[i + 1].size = sweet_pool_blk[i].size - want;
+-			sweet_pool_blk[i + 1].used = false;
+-			sweet_pool_blk[i].size = want;
+-			sweet_pool_nblk++;
+-		}
+-		sweet_pool_blk[i].used = true;
+-		*off = sweet_pool_blk[i].off;
+-		*size = want;
+-		ok = true;
+-		break;
+-	}
+-	IOLockUnlock(sweet_pool_lock);
+-	return ok;
++	return sweet_pool_alloc_in(&sweet_surf_pool, want, off, size);
+ }
+ 
+ static void
+ sweet_pool_free(uint64_t off)
+ {
+-	IOLockLock(sweet_pool_lock);
+-	for (uint32_t i = 0; i < sweet_pool_nblk; i++) {
+-		if (sweet_pool_blk[i].off != off || !sweet_pool_blk[i].used) {
+-			continue;
+-		}
+-		sweet_pool_blk[i].used = false;
+-		if (i + 1 < sweet_pool_nblk && !sweet_pool_blk[i + 1].used) {
+-			sweet_pool_blk[i].size += sweet_pool_blk[i + 1].size;
+-			memmove(&sweet_pool_blk[i + 1], &sweet_pool_blk[i + 2], (sweet_pool_nblk - i - 2) * sizeof(sweet_pool_blk[0]));
+-			sweet_pool_nblk--;
+-		}
+-		if (i > 0 && !sweet_pool_blk[i - 1].used) {
+-			sweet_pool_blk[i - 1].size += sweet_pool_blk[i].size;
+-			memmove(&sweet_pool_blk[i], &sweet_pool_blk[i + 1], (sweet_pool_nblk - i - 1) * sizeof(sweet_pool_blk[0]));
+-			sweet_pool_nblk--;
+-		}
+-		break;
++	sweet_pool_free_in(&sweet_surf_pool, off);
++}
++
++/*
++ * shamrock: GPU buffers (HakiosGPU GEM objects) from the write-combined pool. The GPU SMMU is in
++ * bypass, so a texture or render buffer must be physically contiguous, and a 12 MB contiguous
++ * run is rarely found once userland is up. The block goes back when the descriptor dies.
++ */
++class SweetPoolMemory : public IOSubMemoryDescriptor
++{
++	OSDeclareDefaultStructors(SweetPoolMemory);
++public:
++	uint64_t poolOff;
++	bool     owned;
++protected:
++	virtual void free() APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetPoolMemory, IOSubMemoryDescriptor);
++
++void
++SweetPoolMemory::free()
++{
++	uint64_t off = poolOff;
++	bool was = owned;
++
++	super::free();
++	if (was) {
++		sweet_pool_free_in(&sweet_gpu_pool, off);
+ 	}
+-	IOLockUnlock(sweet_pool_lock);
++}
++
++IOMemoryDescriptor *
++sweet_pool_buffer(uint64_t want, uint8_t **kernel, uint64_t *phys)
++{
++	SweetPoolMemory *m;
++	uint64_t off, size;
++
++	if (!sweet_pool_alloc_in(&sweet_gpu_pool, want, &off, &size)) {
++		return NULL;
++	}
++	m = OSTypeAlloc(SweetPoolMemory);
++	if (m == NULL || !m->initSubRange(sweet_gpu_pool.mem, off, size, kIODirectionInOut)) {
++		OSSafeReleaseNULL(m);
++		sweet_pool_free_in(&sweet_gpu_pool, off);
++		return NULL;
++	}
++	m->poolOff = off;
++	m->owned = true;
++	*kernel = sweet_gpu_pool.kernel + off;
++	*phys = sweet_gpu_pool.phys + off;
++	bzero(*kernel, (size_t)size);
++	__builtin_arm_dsb(0xf);         /* (write-combined: the zeroes are in memory once this is done) */
++	return m;
++}
++
++bool
++sweet_pool_is_buffer(IOMemoryDescriptor *m)
++{
++	return OSDynamicCast(SweetPoolMemory, m) != NULL;
+ }
+ 
+ void
+diff --git c/iokit/Kernel/arm/SweetSurface.h i/iokit/Kernel/arm/SweetSurface.h
+index f05191f..b8a1e22 100644
+--- c/iokit/Kernel/arm/SweetSurface.h
++++ i/iokit/Kernel/arm/SweetSurface.h
+@@ -55,6 +55,10 @@ SweetSurface *sweet_surface_copy(uint32_t id);
+ /* The surface's modification seed (bumped by lock/unlock): HakiosGPU.cpp pushes caches only when it changed. */
+ uint32_t sweet_surface_seed_value(SweetSurface *s);
+ 
++/* shamrock: a zeroed, physically contiguous GPU buffer from the surface pool (NULL: pool full), and whether a descriptor is one. */
++IOMemoryDescriptor *sweet_pool_buffer(uint64_t want, uint8_t **kernel, uint64_t *phys);
++bool sweet_pool_is_buffer(IOMemoryDescriptor *m);
++
+ /*
+  * Publish physical memory (the panel framebuffer) as a surface. Returns a
+  * retained surface that stays in the id table until released by the caller
