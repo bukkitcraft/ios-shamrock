@@ -1,5 +1,5 @@
 diff --git c/bsd/kern/sweet_amfi.c w/bsd/kern/sweet_amfi.c
-index cb67b4d..1e94bde 100644
+index cb67b4d..bdb781b 100644
 --- c/bsd/kern/sweet_amfi.c
 +++ w/bsd/kern/sweet_amfi.c
 @@ -305,8 +305,48 @@ sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
@@ -40,7 +40,7 @@ index cb67b4d..1e94bde 100644
 +		error = copyout(&flags, args.output_flags, sizeof(flags));
 +	}
 +	if (sweet_amfi_debug) {
-+		printf("SWEET AMFI: dyld policy for pid %d -> allow all (%d)\n", proc_getpid(p), error);
++		printf("SWEET AMFI: dyld policy for pid %d -> allow all (%d)\n", proc_pid(p), error);
 +	}
 +	return error;
 +}
