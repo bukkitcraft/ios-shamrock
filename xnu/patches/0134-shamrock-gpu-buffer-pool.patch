@@ -1,8 +1,17 @@
-diff --git c/iokit/Kernel/arm/HakiosGPU.cpp i/iokit/Kernel/arm/HakiosGPU.cpp
-index 197e4cd..de4c435 100644
---- c/iokit/Kernel/arm/HakiosGPU.cpp
-+++ i/iokit/Kernel/arm/HakiosGPU.cpp
-@@ -792,23 +792,43 @@ HakiosGPUUserClient::gemNew(struct msm_gem_new * request)
+diff --git a/iokit/Kernel/arm/HakiosGPU.cpp b/iokit/Kernel/arm/HakiosGPU.cpp
+index 197e4cd..cc45a05 100644
+--- a/iokit/Kernel/arm/HakiosGPU.cpp
++++ b/iokit/Kernel/arm/HakiosGPU.cpp
+@@ -744,7 +744,7 @@ HakiosGPUUserClient::gemNew(struct msm_gem_new * request)
+ {
+ 	uint64_t size = round_page_64(request->size), began = mach_absolute_time();
+ 	struct gpu_buffer * b;
+-	IOBufferMemoryDescriptor * memory;
++	IOMemoryDescriptor * memory;
+ 
+ 	if (size == 0 || size > GPU_BUFFER_MAX) {
+ 		return kIOReturnBadArgument;
+@@ -792,23 +792,44 @@ HakiosGPUUserClient::gemNew(struct msm_gem_new * request)
  		}
  	}
  	IOLockUnlock(gGPULock);
@@ -22,10 +31,11 @@ index 197e4cd..de4c435 100644
 +	}
 +	if (memory == NULL) {
 +		/* (the memory comes zeroed, and making it write-combined pushes the zeroes out of the cache) */
-+		memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
++		IOBufferMemoryDescriptor * vm = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
 +		    kIOMemoryPhysicallyContiguous | (gGPUCached ? 0 : kIOMapWriteCombineCache), (vm_size_t) size, PAGE_SIZE);
-+		if (memory != NULL) {
-+			kernel = (uint8_t *) memory->getBytesNoCopy();
++		memory = vm;
++		if (vm != NULL) {
++			kernel = (uint8_t *) vm->getBytesNoCopy();
 +			if (gGPUCached) {
 +				hakios_gpu_to_memory(kernel, size);
 +			}
@@ -53,10 +63,10 @@ index 197e4cd..de4c435 100644
  		gGPUStat.made++;
  		gGPUStat.making += mach_absolute_time() - began;
  	}
-diff --git c/iokit/Kernel/arm/SweetSurface.cpp i/iokit/Kernel/arm/SweetSurface.cpp
-index 32495c0..d1eb1cc 100644
---- c/iokit/Kernel/arm/SweetSurface.cpp
-+++ i/iokit/Kernel/arm/SweetSurface.cpp
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 32495c0..33e5d6f 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
 @@ -90,92 +90,178 @@ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
   */
  #define SWEET_POOL_MIN          (512u << 10)
@@ -265,7 +275,7 @@ index 32495c0..d1eb1cc 100644
 +	uint64_t off = poolOff;
 +	bool was = owned;
 +
-+	super::free();
++	IOSubMemoryDescriptor::free();
 +	if (was) {
 +		sweet_pool_free_in(&sweet_gpu_pool, off);
  	}
@@ -303,10 +313,10 @@ index 32495c0..d1eb1cc 100644
  }
  
  void
-diff --git c/iokit/Kernel/arm/SweetSurface.h i/iokit/Kernel/arm/SweetSurface.h
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
 index f05191f..b8a1e22 100644
---- c/iokit/Kernel/arm/SweetSurface.h
-+++ i/iokit/Kernel/arm/SweetSurface.h
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
 @@ -55,6 +55,10 @@ SweetSurface *sweet_surface_copy(uint32_t id);
  /* The surface's modification seed (bumped by lock/unlock): HakiosGPU.cpp pushes caches only when it changed. */
  uint32_t sweet_surface_seed_value(SweetSurface *s);
