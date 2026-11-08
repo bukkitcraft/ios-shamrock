@@ -1,0 +1,222 @@
+diff --git c/iokit/Kernel/arm/SweetFramebuffer.cpp i/iokit/Kernel/arm/SweetFramebuffer.cpp
+index faf1489..35e3630 100644
+--- c/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ i/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -37,6 +37,9 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
++/* HakiosGPU.cpp: waits up to the given milliseconds for the GPU to finish drawing into the surface */
++bool MiniIOSurfaceDrawn(SweetSurface *surface, uint64_t milliseconds);
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -377,6 +380,11 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
++		if (s->drawn != 0 && src != 0) {
++			/* drawn by the GPU straight into memory: wait for it, then drop any stale lines of this processor's cache */
++			(void)MiniIOSurfaceDrawn(s, 50);
++			flush_dcache64((addr64_t)src, (unsigned)MIN((uint64_t)s->allocSize, (uint64_t)s->bytesPerRow * s->height), FALSE);
++		}
+ 		if (w <= 0 || h <= 0) {
+ 			w = (int32_t)s->width;
+ 			h = (int32_t)s->height;
+diff --git c/iokit/Kernel/arm/SweetSurface.cpp i/iokit/Kernel/arm/SweetSurface.cpp
+index d586050..75193ee 100644
+--- c/iokit/Kernel/arm/SweetSurface.cpp
++++ i/iokit/Kernel/arm/SweetSurface.cpp
+@@ -33,6 +33,9 @@
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOLocks.h>
++#include <IOKit/IOSubMemoryDescriptor.h>
++#include <mach/vm_param.h>
++#include <pexpert/pexpert.h>
+ #include <IOKit/system.h>
+ #include <libkern/c++/OSArray.h>
+ #include <libkern/c++/OSDictionary.h>
+@@ -77,6 +80,104 @@ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
++
++/*
++ * shamrock: the A405's SMMU is in bypass, so the GPU can only draw into physically contiguous memory.
++ * A few minutes after boot no large contiguous run is left (vm_page_find_contiguous fails for the
++ * 13.8 MB render targets of backboardd), so a pool is taken while memory is still unfragmented
++ * (IOCoreSurfaceRoot::start, boot-arg sweetsurfpool=<MB>, default 96, 0 = none) and every surface of
++ * SWEET_POOL_MIN bytes or more gets its pixels from it (first fit, coalescing free list).
++ */
++#define SWEET_POOL_MIN          (512u << 10)
++#define SWEET_POOL_BLOCKS       128
++static IOBufferMemoryDescriptor *sweet_pool;
++static uint64_t sweet_pool_bytes;
++static IOLock *sweet_pool_lock;
++static struct { uint64_t off, size; bool used; } sweet_pool_blk[SWEET_POOL_BLOCKS];
++static uint32_t sweet_pool_nblk;
++
++static void
++sweet_pool_init(void)
++{
++	uint32_t mb = 96;
++
++	PE_parse_boot_argn("sweetsurfpool", &mb, sizeof(mb));
++	for (; mb >= 16 && sweet_pool == NULL; mb = mb * 3 / 4) {
++		sweet_pool = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, (vm_size_t)mb << 20, page_size);
++		if (sweet_pool != NULL) {
++			sweet_pool_bytes = (uint64_t)mb << 20;
++		}
++	}
++	if (sweet_pool == NULL) {
++		IOLog("SWEET SURF: no contiguous surface pool (GPU cannot draw into large surfaces)\n");
++		return;
++	}
++	sweet_pool_lock = IOLockAlloc();
++	sweet_pool_blk[0].off = 0;
++	sweet_pool_blk[0].size = sweet_pool_bytes;
++	sweet_pool_blk[0].used = false;
++	sweet_pool_nblk = 1;
++	IOLog("SWEET SURF: contiguous surface pool %llu MB at phys 0x%llx\n", sweet_pool_bytes >> 20,
++	    (uint64_t)sweet_pool->getPhysicalSegment(0, NULL, kIOMemoryMapperNone));
++}
++
++static bool
++sweet_pool_alloc(uint64_t want, uint64_t *off, uint64_t *size)
++{
++	bool ok = false;
++
++	want = round_page_64(want);
++	IOLockLock(sweet_pool_lock);
++	for (uint32_t i = 0; i < sweet_pool_nblk; i++) {
++		if (sweet_pool_blk[i].used || sweet_pool_blk[i].size < want) {
++			continue;
++		}
++		if (sweet_pool_blk[i].size > want) {
++			if (sweet_pool_nblk >= SWEET_POOL_BLOCKS) {
++				break;
++			}
++			memmove(&sweet_pool_blk[i + 2], &sweet_pool_blk[i + 1], (sweet_pool_nblk - i - 1) * sizeof(sweet_pool_blk[0]));
++			sweet_pool_blk[i + 1].off = sweet_pool_blk[i].off + want;
++			sweet_pool_blk[i + 1].size = sweet_pool_blk[i].size - want;
++			sweet_pool_blk[i + 1].used = false;
++			sweet_pool_blk[i].size = want;
++			sweet_pool_nblk++;
++		}
++		sweet_pool_blk[i].used = true;
++		*off = sweet_pool_blk[i].off;
++		*size = want;
++		ok = true;
++		break;
++	}
++	IOLockUnlock(sweet_pool_lock);
++	return ok;
++}
++
++static void
++sweet_pool_free(uint64_t off)
++{
++	IOLockLock(sweet_pool_lock);
++	for (uint32_t i = 0; i < sweet_pool_nblk; i++) {
++		if (sweet_pool_blk[i].off != off || !sweet_pool_blk[i].used) {
++			continue;
++		}
++		sweet_pool_blk[i].used = false;
++		if (i + 1 < sweet_pool_nblk && !sweet_pool_blk[i + 1].used) {
++			sweet_pool_blk[i].size += sweet_pool_blk[i + 1].size;
++			memmove(&sweet_pool_blk[i + 1], &sweet_pool_blk[i + 2], (sweet_pool_nblk - i - 2) * sizeof(sweet_pool_blk[0]));
++			sweet_pool_nblk--;
++		}
++		if (i > 0 && !sweet_pool_blk[i - 1].used) {
++			sweet_pool_blk[i - 1].size += sweet_pool_blk[i].size;
++			memmove(&sweet_pool_blk[i], &sweet_pool_blk[i + 1], (sweet_pool_nblk - i - 1) * sizeof(sweet_pool_blk[0]));
++			sweet_pool_nblk--;
++		}
++		break;
++	}
++	IOLockUnlock(sweet_pool_lock);
++}
++
+ void
+ SweetSurface::free()
+ {
+@@ -85,6 +186,9 @@ SweetSurface::free()
+ 	}
+ 	OSSafeReleaseNULL(kernelMap);
+ 	OSSafeReleaseNULL(memory);
++	if (poolSize != 0) {
++		sweet_pool_free(poolOffset);
++	}
+ 	OSSafeReleaseNULL(state);
+ 	OSObject::free();
+ }
+@@ -399,6 +503,7 @@ IOCoreSurfaceRoot::start(IOService *provider)
+ 		return false;
+ 	}
+ 	sweet_surface_init_lock();
++	sweet_pool_init();
+ 	setProperty(kIOUserClientClassKey, "IOSurfaceRootUserClient");
+ 	registerService();
+ 	IOLog("SWEET SURF: IOCoreSurfaceRoot registered\n");
+@@ -691,22 +796,36 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = sweet_surface_layout(s, props);
+ 	if (ret == kIOReturnSuccess) {
+-		IOBufferMemoryDescriptor *mem = NULL;
+-		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+-		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+-			/* shamrock: physically contiguous when possible, so the GPU (no SMMU here) can draw into it */
+-			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-			    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, s->allocSize, page_size);
++		IOMemoryDescriptor *mem = NULL;
++		uint64_t poff = 0, psize = 0;
++		/* shamrock: large surfaces from the contiguous pool (GPU render targets), see sweet_pool_init() */
++		if (sweet_pool != NULL && s->allocSize >= SWEET_POOL_MIN && sweet_pool_alloc(s->allocSize, &poff, &psize)) {
++			mem = IOSubMemoryDescriptor::withSubRange(sweet_pool, poff, psize, kIODirectionInOut);
+ 			if (mem == NULL) {
+-				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-				    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++				sweet_pool_free(poff);
++				psize = 0;
++			} else {
++				bzero((uint8_t *)sweet_pool->getBytesNoCopy() + poff, (size_t)psize);
+ 			}
+ 		}
+-		if (mem == NULL) {
++		if (mem == NULL && (uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
++		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
++			IOBufferMemoryDescriptor *bm = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++			    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++			if (bm != NULL) {
++				bzero(bm->getBytesNoCopy(), s->allocSize);
++				mem = bm;
++			} else {
++				OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
++			}
++		} else if (mem == NULL) {
+ 			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
++		}
++		if (mem == NULL) {
+ 			ret = kIOReturnNoMemory;
+ 		} else {
+-			bzero(mem->getBytesNoCopy(), s->allocSize);
++			s->poolOffset = poff;
++			s->poolSize = psize;
+ 			s->memory = mem;
+ 			s->mapCache = kIOMapDefaultCache;
+ 			if (!sweet_surface_publish(s)) {
+diff --git c/iokit/Kernel/arm/SweetSurface.h i/iokit/Kernel/arm/SweetSurface.h
+index b3154b5..f05191f 100644
+--- c/iokit/Kernel/arm/SweetSurface.h
++++ i/iokit/Kernel/arm/SweetSurface.h
+@@ -34,6 +34,7 @@ public:
+ 	uint8_t  elementWidth, elementHeight;
+ 	uint32_t cacheMode, planeCount, parentID;
+ 	uint32_t drawn;                         /* shamrock: fence of the last GPU submission that drew into it (HakiosGPU.cpp) */
++	uint64_t poolOffset, poolSize;          /* shamrock: pixels in the contiguous surface pool (poolSize 0: not) */
+ 	struct sweet_surface_plane planes[SWEET_SURFACE_MAX_PLANES];
+ 
+ 	IOMemoryDescriptor       *memory;       /* pixels (buffer or physical) */
