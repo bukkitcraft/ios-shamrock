@@ -44,12 +44,18 @@ index 0000000..e4d7b0b
 +#define SHAMROCK_GCC_PA   0x01800000ULL
 +#define SHAMROCK_GPU_PA   0x01c00000ULL
 +
-+#define OXILI_GX_GDSCR    0x5901c
-+#define GCC_OXILI_GFX3D   0x59020
-+#define GCC_OXILI_GMEM    0x59024
-+#define GCC_OXILI_AHB     0x59028
-+#define GFX3D_CLK_SRC_CMD 0x59000
-+#define GFX3D_CLK_SRC_CFG 0x59004
++#define APCS_GPLL_ENA_VOTE 0x45000
++#define GPLL0_STATUS       0x2101c
++#define GFX3D_CLK_SRC_CMD  0x59000
++#define GFX3D_CLK_SRC_CFG  0x59004
++#define OXILI_GX_GDSCR     0x5901c
++#define GCC_OXILI_GFX3D    0x59020
++#define GCC_OXILI_GMEM     0x59024
++#define GCC_OXILI_AHB      0x59028
++#define GCC_BIMC_GPU       0x59030
++#define GCC_BIMC_GFX       0x59034
++#define GCC_OXILI_TIMER    0x59040
++#define APCS_SMMU_VOTE     0x4500c
 +
 +#define RING_WORDS        8192
 +#define RING_SIZE         (RING_WORDS * 4)
@@ -112,12 +118,58 @@ index 0000000..e4d7b0b
 +
 +static bool power_on_oxili(void)
 +{
++	IOLog("SWEET A405: starting power & clock sequencing...\n");
++
++	/*
++	 * 1. Vote for GPLL0 (800 MHz general PLL) in APCS_GPLL_ENA_VOTE.
++	 */
++	gcc_write(APCS_GPLL_ENA_VOTE, gcc_read(APCS_GPLL_ENA_VOTE) | 1u);
++	for (int i = 0; i < 2000; i++) {
++		if (gcc_read(GPLL0_STATUS) & (1u << 17)) {
++			break;
++		}
++		delay(10);
++	}
++
++	/*
++	 * 2. Vote for GPU SMMU TCU/TBU & GTCU AHB clocks in APCS_SMMU_VOTE (0x4500c)
++	 *    to prevent memory transaction stalls on the system bus.
++	 */
++	gcc_write(APCS_SMMU_VOTE, gcc_read(APCS_SMMU_VOTE) | (1u << 13) | (1u << 3) | (1u << 2));
++
++	/*
++	 * 3. Configure GFX3D root clock (GFX3D_CLK_SRC):
++	 *    Source: GPLL0 (src=1 -> bits 10:8 = 1)
++	 *    Divider: 2 (400 MHz safe operating frequency, 2*div - 1 = 3 -> bits 4:0 = 3)
++	 *    CFG = (1 << 8) | 3 = 0x00000103.
++	 */
++	gcc_write(GFX3D_CLK_SRC_CFG, (1u << 8) | 3u);
++	gcc_write(GFX3D_CLK_SRC_CMD, 1u);
++	for (int i = 0; i < 2000; i++) {
++		if (!(gcc_read(GFX3D_CLK_SRC_CMD) & 1u)) {
++			break;
++		}
++		delay(10);
++	}
++	delay(50);
++
++	/*
++	 * 4. Configure OXILI_GX_GDSCR wait states and clear SW_OVERRIDE / HW_CONTROL:
++	 *    EN_REST_WAIT_VAL (0x2 << 20) | EN_FEW_WAIT_VAL (0x8 << 16) | CLK_DIS_WAIT_VAL (0x2 << 12)
++	 */
 +	uint32_t val = gcc_read(OXILI_GX_GDSCR);
++	val &= ~((0xFu << 20) | (0xFu << 16) | (0xFu << 12) | (1u << 1) | (1u << 2));
++	val |= (0x2u << 20) | (0x8u << 16) | (0x2u << 12);
++	gcc_write(OXILI_GX_GDSCR, val);
++
++	/*
++	 * 5. Power ON GDSC power domain by de-asserting SW_COLLAPSE (bit 0):
++	 */
 +	val &= ~1u;
 +	gcc_write(OXILI_GX_GDSCR, val);
 +
 +	bool ok = false;
-+	for (int i = 0; i < 1000; i++) {
++	for (int i = 0; i < 5000; i++) {
 +		if (gcc_read(OXILI_GX_GDSCR) & (1u << 31)) {
 +			ok = true;
 +			break;
@@ -125,25 +177,49 @@ index 0000000..e4d7b0b
 +		delay(10);
 +	}
 +	if (!ok) {
-+		IOLog("SWEET A405: OXILI_GX_GDSC power on timeout\n");
++		IOLog("SWEET A405: OXILI_GX_GDSC power on timeout (GDSCR=0x%08x)\n", gcc_read(OXILI_GX_GDSCR));
 +		return false;
 +	}
-+
-+	gcc_write(GFX3D_CLK_SRC_CFG, (1 << 8) | (2 - 1));
-+	gcc_write(GFX3D_CLK_SRC_CMD, 1);
 +	delay(50);
 +
-+	gcc_write(GCC_OXILI_AHB, gcc_read(GCC_OXILI_AHB) | 1);
-+	gcc_write(GCC_OXILI_GFX3D, gcc_read(GCC_OXILI_GFX3D) | 1);
-+	gcc_write(GCC_OXILI_GMEM, gcc_read(GCC_OXILI_GMEM) | 1);
++	/*
++	 * 6. Enable all 6 clock branches inside the power domain and bus interfaces:
++	 *    OXILI_AHB   (0x59028)
++	 *    OXILI_GFX3D (0x59020)
++	 *    OXILI_GMEM  (0x59024)
++	 *    BIMC_GPU    (0x59030)
++	 *    BIMC_GFX    (0x59034)
++	 *    OXILI_TIMER (0x59040)
++	 */
++	gcc_write(GCC_OXILI_AHB, gcc_read(GCC_OXILI_AHB) | 1u);
++	gcc_write(GCC_OXILI_GFX3D, gcc_read(GCC_OXILI_GFX3D) | 1u);
++	gcc_write(GCC_OXILI_GMEM, gcc_read(GCC_OXILI_GMEM) | 1u);
++	gcc_write(GCC_BIMC_GPU, gcc_read(GCC_BIMC_GPU) | 1u);
++	gcc_write(GCC_BIMC_GFX, gcc_read(GCC_BIMC_GFX) | 1u);
++	gcc_write(GCC_OXILI_TIMER, gcc_read(GCC_OXILI_TIMER) | 1u);
++
++	/* Wait for branches to assert (halt bits 31:28 become 0) */
++	for (int i = 0; i < 2000; i++) {
++		if (!((gcc_read(GCC_OXILI_AHB) | gcc_read(GCC_OXILI_GFX3D) | gcc_read(GCC_BIMC_GPU)) & (0xFu << 28))) {
++			break;
++		}
++		delay(10);
++	}
 +	delay(50);
 +
-+	IOLog("SWEET A405: clocks enabled\n");
++	IOLog("SWEET A405: GDSC powered on, all 9 GPU clocks active at 400 MHz\n");
 +	return true;
 +}
 +
 +static bool a4xx_hw_init(void)
 +{
++	IOLog("SWEET A405: resetting GPU core...\n");
++	gpu_write(REG_A4XX_RBBM_SW_RESET_CMD, 1);
++	(void)gpu_read(REG_A4XX_RBBM_SW_RESET_CMD);
++	delay(50);
++	gpu_write(REG_A4XX_RBBM_SW_RESET_CMD, 0);
++	delay(50);
++
 +	gpu_write(REG_A4XX_VBIF_ROUND_ROBIN_QOS_ARB, 0x00000003);
 +	gpu_write(REG_A4XX_RBBM_GPU_BUSY_MASKED, 0xffffffff);
 +	gpu_write(REG_A4XX_RBBM_SP_HYST_CNT, 0x10);
@@ -179,7 +255,8 @@ index 0000000..e4d7b0b
 +
 +	gpu_write(REG_A4XX_RBBM_INT_0_MASK, 0);
 +
-+	gpu_write(REG_A4XX_CP_RB_CNTL, 0x0000000f | (1 << 27));
++	/* 8192 words (4096 quadwords) -> ilog2(4096) = 12 = 0x0c */
++	gpu_write(REG_A4XX_CP_RB_CNTL, 0x0000000c | (1 << 27));
 +	gpu_write(REG_A4XX_CP_RB_BASE, (uint32_t)g_ring_phys);
 +
 +	/* Load PM4 ucode */
@@ -1231,6 +1308,7 @@ index 0000000..04a5503
 +#include <stdint.h>
 +
 +/* Adreno 405 (A4xx) Hardware Registers */
++#define REG_A4XX_RBBM_SW_RESET_CMD              0x00000022
 +#define REG_A4XX_RBBM_AHB_CTL0                  0x00000023
 +#define REG_A4XX_RBBM_AHB_CTL1                  0x00000024
 +#define REG_A4XX_RBBM_SP_HYST_CNT               0x00000021
