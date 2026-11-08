@@ -1,6 +1,8 @@
---- a/bsd/kern/kern_exec.c
-+++ b/bsd/kern/kern_exec.c
-@@ -5586,10 +5586,82 @@
+diff --git i/bsd/kern/kern_exec.c w/bsd/kern/kern_exec.c
+index 5205a15..290b7a2 100644
+--- i/bsd/kern/kern_exec.c
++++ w/bsd/kern/kern_exec.c
+@@ -5586,10 +5586,82 @@ bad:
   * Note:	The argument and environment vectors are user space pointers
   *		to arrays of user space pointers.
   */
@@ -83,7 +85,7 @@
  	int error = 0;
  	int     ptr_size = (imgp->ip_flags & IMGPF_WAS_64BIT_ADDR) ? 8 : 4;
  	int new_ptr_size = (imgp->ip_flags & IMGPF_IS_64BIT_ADDR) ? 8 : 4;
-@@ -5759,6 +5831,20 @@
+@@ -5759,6 +5831,21 @@ exec_extract_strings(struct image_params *imgp)
  		imgp->ip_envc++;
  	}
  
@@ -105,3 +107,46 @@
  	/* Save space for envv[] NULL terminator */
  	if (imgp->ip_argspace < new_ptr_size) {
  		error = E2BIG;
+diff --git i/iokit/Kernel/arm/SweetAdreno.cpp w/iokit/Kernel/arm/SweetAdreno.cpp
+index 02aa4a8..831ec1f 100644
+--- i/iokit/Kernel/arm/SweetAdreno.cpp
++++ w/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -541,6 +541,11 @@ public:
+ 	bool initWithTask(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties) APPLE_KEXT_OVERRIDE {
+ 		if (!IOUserClient::initWithTask(owningTask, securityID, type, properties)) return false;
+ 		fTask = owningTask;
++		{
++			char who[32] = "?";
++			proc_selfname(who, sizeof(who));
++			IOLog("SWEET A405: user client opened by %s (type %u)\n", who, (unsigned)type);
++		}
+ 		return true;
+ 	}
+ 
+@@ -668,6 +673,13 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 			words[i] = cmds[i].size / 4;
+ 		}
+ 		req.fence = hakios_gpu_submit(addrs, words, req.nr_cmds);
++		{
++			static uint32_t submits;
++			if (++submits <= 8 || (submits % 500) == 0) {
++				IOLog("SWEET A405: submit #%u: %u cmds, first ib 0x%llx (%u words), fence %u\n",
++				    submits, req.nr_cmds, req.nr_cmds ? addrs[0] : 0ULL, req.nr_cmds ? words[0] : 0, req.fence);
++			}
++		}
+ 		IOLockUnlock(gGPULock);
+ 
+ 		if (args->structureOutput && args->structureOutputSize >= sizeof(req)) {
+@@ -682,6 +694,12 @@ HakiosGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
+ 			if (hakios_gpu_done(w.fence)) return kIOReturnSuccess;
+ 			delay(100);
+ 		}
++		{
++			static uint32_t timeouts;
++			if (++timeouts <= 8 || (timeouts % 100) == 0) {
++				IOLog("SWEET A405: fence %u TIMEOUT (#%u)\n", w.fence, timeouts);
++			}
++		}
+ 		return kIOReturnTimeout;
+ 	}
+ 	case kHakiosSurface: {
