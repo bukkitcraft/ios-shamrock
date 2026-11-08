@@ -746,17 +746,17 @@ index 0000000..e4d7b0b
 +	}
 +}
 +
-+class SweetAdreno : public IOService {
-+	OSDeclareDefaultStructors(SweetAdreno);
++class HakiosGPU : public IOService {
++	OSDeclareDefaultStructors(HakiosGPU);
 +
 +public:
 +	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
 +};
 +
-+OSDefineMetaClassAndStructors(SweetAdreno, IOService);
++OSDefineMetaClassAndStructors(HakiosGPU, IOService);
 +
 +bool
-+SweetAdreno::start(IOService *provider)
++HakiosGPU::start(IOService *provider)
 +{
 +	if (!IOService::start(provider)) return false;
 +
@@ -1397,9 +1397,9 @@ index 92f3e26..f726882 100644
      "     'IOMatchCategory' = SweetBattery;"
      "   },"
 +    "   {"
-+    "     'IOClass'         = SweetAdreno;"
++    "     'IOClass'         = HakiosGPU;"
 +    "     'IOProviderClass' = IOResources;"
-+    "     'IOMatchCategory' = SweetAdreno;"
++    "     'IOMatchCategory' = HakiosGPU;"
 +    "   },"
  #endif
      "   {"
