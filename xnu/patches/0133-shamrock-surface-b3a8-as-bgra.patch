@@ -1,0 +1,46 @@
+diff --git c/iokit/Kernel/arm/SweetSurface.cpp i/iokit/Kernel/arm/SweetSurface.cpp
+index 75193ee..32495c0 100644
+--- c/iokit/Kernel/arm/SweetSurface.cpp
++++ i/iokit/Kernel/arm/SweetSurface.cpp
+@@ -398,6 +398,23 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	s->elementWidth = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementWidth", 1);
+ 	s->elementHeight = (uint8_t)sweet_dict_u32(props, "IOSurfaceElementHeight", 1);
+ 	s->pixelFormat = sweet_dict_u32(props, "IOSurfacePixelFormat", 0);
++	/*
++	 * shamrock (as HackiOS's MiniIOSurface): the panel shows 8-bit BGRA only and the GL bridge (eagl.c
++	 * -attachImage) takes one-plane BGRA only. CoreAnimation asks for 'b3a8' (BGRA with alpha in a plane of its
++	 * own) for the screen's surfaces once it draws with the GL renderer, and for 10-bit wide-gamut formats
++	 * ('w30r', 'l10r', 'w30R') on a P3 panel: all are made as one-plane BGRA of the same geometry; whoever uses
++	 * the surface reads the format back from it. Without this the render targets were refused ("attachImage:
++	 * ... 'b3a8': not done") and every draw failed with GL_INVALID_FRAMEBUFFER_OPERATION (black screen).
++	 */
++	bool onePlane = false;
++	if (s->pixelFormat == 'w30r' || s->pixelFormat == 'l10r' || s->pixelFormat == 'w30R') {
++		s->pixelFormat = 'BGRA';
++		s->bytesPerElement = 4;
++	} else if (s->pixelFormat == 'b3a8') {
++		s->pixelFormat = 'BGRA';
++		s->bytesPerElement = 4;
++		onePlane = true;
++	}
+ 	s->cacheMode = sweet_dict_u32(props, "IOSurfaceCacheMode", 0);
+ 	s->offset = sweet_dict_u32(props, "IOSurfaceOffset", 0);
+ 	if (s->width > SWEET_SURFACE_MAX_DIM || s->height > SWEET_SURFACE_MAX_DIM ||
+@@ -411,7 +428,7 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 	}
+ 	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
+ 
+-	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
++	OSArray *planes = onePlane ? NULL : OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
+ 	s->planeCount = 0;
+ 	if (planes != NULL) {
+ 		uint64_t next = s->offset;
+@@ -446,7 +463,7 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+ 		s->planeCount = planes->getCount();
+ 	}
+ 
+-	uint64_t alloc = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
++	uint64_t alloc = onePlane ? 0 : sweet_dict_u32(props, "IOSurfaceAllocSize", 0);    /* (one plane: not the two-plane size asked for) */
+ 	if (alloc < end) {
+ 		alloc = end;
+ 	}
