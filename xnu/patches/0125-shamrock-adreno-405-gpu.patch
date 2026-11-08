@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000..e4d7b0b
 --- /dev/null
 +++ i/iokit/Kernel/arm/SweetAdreno.cpp
-@@ -0,0 +1,715 @@
+@@ -0,0 +1,792 @@
 +/*
 + * SweetAdreno.cpp: Qualcomm Adreno 405 (A4xx) GPU driver and HakiosGPU service for MSM8952.
 + */
@@ -1301,7 +1301,7 @@ new file mode 100644
 index 0000000..04a5503
 --- /dev/null
 +++ i/iokit/Kernel/arm/a4xx_regs.h
-@@ -0,0 +1,52 @@
+@@ -0,0 +1,53 @@
 +#ifndef _A4XX_REGS_H_
 +#define _A4XX_REGS_H_
 +
