@@ -1,0 +1,32 @@
+diff --git c/osfmk/vm/vm_kern.c i/osfmk/vm/vm_kern.c
+index 54edb01..a1dbb59 100644
+--- c/osfmk/vm/vm_kern.c
++++ i/osfmk/vm/vm_kern.c
+@@ -3641,6 +3641,27 @@ kmem_scramble_ranges(void)
+ 		struct mach_vm_range *sp_range = sp.kc_range;
+ 		if (vm_map_locate_space(kernel_map, sp.kc_size, 0,
+ 		    VM_MAP_KERNEL_FLAGS_ANYWHERE(), &start, NULL) != KERN_SUCCESS) {
++#if defined(SWEET)
++			/*
++			 * shamrock (full RAM, 4K pages, no ARM_LARGE_MEMORY): show the numbers, then try
++			 * once more from the bottom of the kernel map before giving up.
++			 */
++			vm_map_size_t largest = 0;
++			vm_map_sizes(kernel_map, NULL, NULL, &largest);
++			printf("SWEET KMEM: claim %u/%u %s size %#llx failed at start %#llx; largest free %#llx; map %#llx-%#llx\n",
++			    i, kmem_claim_count, sp.kc_name, (uint64_t)sp.kc_size, (uint64_t)start, (uint64_t)largest,
++			    (uint64_t)kernel_map->min_offset, (uint64_t)kernel_map->max_offset);
++			for (uint32_t j = 0; j < kmem_claim_count; j++) {
++				printf("SWEET KMEM:   claim %u %s size %#llx range %#llx-%#llx\n", j, kmem_claims[j].kc_name,
++				    (uint64_t)kmem_claims[j].kc_size, (uint64_t)kmem_claims[j].kc_range->min_address,
++				    (uint64_t)kmem_claims[j].kc_range->max_address);
++			}
++			start = kernel_map->min_offset;
++			if (vm_map_locate_space(kernel_map, sp.kc_size, 0,
++			    VM_MAP_KERNEL_FLAGS_ANYWHERE(), &start, NULL) == KERN_SUCCESS) {
++				printf("SWEET KMEM: %s placed at %#llx on the second try\n", sp.kc_name, (uint64_t)start);
++			} else
++#endif
+ 			panic("kmem_range_init: vm_map_locate_space failing for claim %s",
+ 			    sp.kc_name);
+ 		}
