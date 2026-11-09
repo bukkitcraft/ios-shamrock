@@ -1,0 +1,133 @@
+diff --git c/iokit/Kernel/arm/SweetFramebuffer.cpp i/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 35e3630..8a167d6 100644
+--- c/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ i/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -38,6 +38,22 @@
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++
++/*
++ * shamrock: double buffering. r53 (GPU, sysmem): the frame visibly painted itself from top to
++ * bottom: present() scales each frame into the very memory the MDP is scanning. A second panel
++ * buffer at 0x90800000 (inside the firmware hole, never xnu's RAM; 0x90000000 + 2 x 8.3 MB fits
++ * below 0x91000000): each frame is drawn into the one not shown, then the MDP's RGB0 pipe is
++ * pointed at it (SRC0_ADDR) and flushed (CTL0 FLUSH bit 3), which takes effect at the next
++ * vsync; the next frame waits for that flush bit to clear before drawing into the other one.
++ * Same registers as the s1 shim's display switch. sweetfb_double=0: one buffer, as before.
++ */
++#define SWEET_FB_BUF1_PHYS      0x90800000ULL
++#define SWEET_MDP_PA            0x01a00000ULL   /* MDP base 0x01a01000: CTL0 at +0x2000, RGB0 at +0x15000 */
++#define SWEET_MDP_CTL0_FLUSH    (0x2000 + 0x18)
++#define SWEET_MDP_RGB0_SRC0     (0x15000 + 0x14)
+ /* HakiosGPU.cpp: waits up to the given milliseconds for the GPU to finish drawing into the surface */
+ bool MiniIOSurfaceDrawn(SweetSurface *surface, uint64_t milliseconds);
+ 
+@@ -108,6 +124,10 @@ public:
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
++	uintptr_t     fBuf[2];          /* double buffering: kernel mappings of the two panel buffers */
++	uint64_t      fBufPhys[2];
++	uint32_t      fFront;           /* the one the MDP shows */
++	volatile uint32_t *fMDP;        /* 0: one buffer */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+ 	IOLock       *fLock;            /* swaps and client list */
+@@ -211,6 +231,26 @@ AppleCLCD::start(IOService *provider)
+ 		OSSafeReleaseNULL(fWorkLoop);
+ 		return false;
+ 	}
++	{
++		int dbl = 1;
++		vm_size_t bytes = round_page((vm_size_t)fRowBytes * fHeight);
++		PE_parse_boot_argn("sweetfb_double", &dbl, sizeof(dbl));
++		if (dbl && fPhys == 0x90000000ULL && SWEET_FB_BUF1_PHYS + bytes <= 0x91000000ULL) {
++			fBuf[0] = fPixels;
++			fBufPhys[0] = fPhys;
++			fBufPhys[1] = SWEET_FB_BUF1_PHYS;
++			fBuf[1] = ml_io_map_wcomb((vm_offset_t)SWEET_FB_BUF1_PHYS, bytes);
++			fMDP = (volatile uint32_t *)ml_io_map((vm_offset_t)SWEET_MDP_PA, 0x20000);
++			if (fBuf[1] == 0 || fMDP == NULL) {
++				fMDP = NULL;
++			} else {
++				memcpy((void *)fBuf[1], (const void *)fBuf[0], (size_t)fRowBytes * fHeight);
++				fFront = 0;
++				IOLog("SWEET FB: double buffering: %#llx and %#llx, RGB0 SRC0_ADDR %#x\n", fBufPhys[0], fBufPhys[1],
++				    fMDP[SWEET_MDP_RGB0_SRC0 / 4]);
++			}
++		}
++	}
+ 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
+ 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+ 		IOLog("SWEET FB: no vsync timer\n");
+@@ -343,6 +383,17 @@ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
++	uintptr_t draw = fPixels;
++	uint32_t back = fFront ^ 1;
++	bool drew = false;
++
++	if (fMDP != NULL) {
++		/* the last flip must have happened (its flush bit clears at the vsync that takes it) */
++		for (int i = 0; i < 400 && (fMDP[SWEET_MDP_CTL0_FLUSH / 4] & 0x8); i++) {
++			IODelay(50);
++		}
++		draw = fBuf[back];
++	}
+ 
+ 
+ 	if (!fConsolePaused) {
+@@ -480,7 +531,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 							    (uint64_t)sy0 * s->bytesPerRow);
+ 							const uint32_t *src_row1 = (const uint32_t *)(src + s->offset +
+ 							    (uint64_t)(sy0 + 1) * s->bytesPerRow);
+-							volatile uint32_t *dst_row = (volatile uint32_t *)(fPixels +
++							volatile uint32_t *dst_row = (volatile uint32_t *)(draw +
+ 							    (uint64_t)py * fRowBytes);
+ 							for (uint32_t px = 0; px < off_x; px++) {
+ 								dst_row[px] = 0xff000000u;
+@@ -506,7 +557,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 							uint32_t sy_coord = (py * s->height) / fHeight;
+ 							const uint32_t *src_row = (const uint32_t *)(src + s->offset +
+ 							    (uint64_t)sy_coord * s->bytesPerRow);
+-							volatile uint32_t *dst_row = (volatile uint32_t *)(fPixels +
++							volatile uint32_t *dst_row = (volatile uint32_t *)(draw +
+ 							    (uint64_t)py * fRowBytes);
+ 							for (uint32_t px = 0; px < off_x; px++) {
+ 								dst_row[px] = 0xff000000u;
+@@ -530,7 +581,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 						uint32_t sy_coord = (py * s->height) / fHeight;
+ 						const uint32_t *src_row = (const uint32_t *)(src + s->offset +
+ 						    (uint64_t)sy_coord * s->bytesPerRow);
+-						volatile uint32_t *dst_row = (volatile uint32_t *)(fPixels +
++						volatile uint32_t *dst_row = (volatile uint32_t *)(draw +
+ 						    (uint64_t)py * fRowBytes);
+ 						for (uint32_t px = 0; px < max_w; px++) {
+ 							dst_row[px] = src_row[sx_map[px]];
+@@ -539,13 +590,21 @@ AppleCLCD::present(const uint8_t *rec)
+ 				}
+ 			} else {
+ 				for (int32_t y = 0; y < h; y++) {
+-					memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
++					memcpy((void *)(draw + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 					    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+ 					    (size_t)w * 4);
+ 				}
+ 			}
+ 		}
+ 		s->release();
++		drew = true;
++	}
++	if (fMDP != NULL && drew) {
++		__builtin_arm_dsb(0xf);
++		fMDP[SWEET_MDP_RGB0_SRC0 / 4] = (uint32_t)fBufPhys[back];
++		fMDP[SWEET_MDP_CTL0_FLUSH / 4] = fMDP[SWEET_MDP_CTL0_FLUSH / 4] | 0x8;
++		__builtin_arm_dsb(0xf);
++		fFront = back;
+ 	}
+ }
+ 
