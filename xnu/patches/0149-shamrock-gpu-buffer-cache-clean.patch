@@ -1,0 +1,46 @@
+diff --git c/iokit/Kernel/arm/HakiosGPU.cpp i/iokit/Kernel/arm/HakiosGPU.cpp
+index fc9b7eb..6a8cb73 100644
+--- c/iokit/Kernel/arm/HakiosGPU.cpp
++++ i/iokit/Kernel/arm/HakiosGPU.cpp
+@@ -835,9 +835,14 @@ HakiosGPUUserClient::gemNew(struct msm_gem_new * request)
+ 		memory = vm;
+ 		if (vm != NULL) {
+ 			kernel = (uint8_t *) vm->getBytesNoCopy();
+-			if (gGPUCached) {
+-				hakios_gpu_to_memory(kernel, size);
+-			}
++			/*
++			 * shamrock: always push the zeroes out. The kernel's view of an IOBufferMemoryDescriptor
++			 * is ordinary cached memory even with kIOMapWriteCombineCache (only later mappings are
++			 * write-combined); the zeroing left dirty lines that were written back later over what
++			 * the client had written through its write-combined mapping (textures, vertices,
++			 * commands: blank icons, garbage, "msm dump submit"). ios-river 0192 found the same.
++			 */
++			hakios_gpu_to_memory(kernel, size);
+ 		}
+ 	}
+ 	if (memory == NULL && (smmu || size < (512u << 10))) {
+diff --git c/iokit/Kernel/arm/SweetSurface.cpp i/iokit/Kernel/arm/SweetSurface.cpp
+index 0abd073..8332444 100644
+--- c/iokit/Kernel/arm/SweetSurface.cpp
++++ i/iokit/Kernel/arm/SweetSurface.cpp
+@@ -98,6 +98,8 @@ struct sweet_pool_t {
+ 	struct { uint64_t off, size; bool used; } blk[SWEET_POOL_BLOCKS];
+ 	uint32_t nblk;
+ };
++extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
++
+ static struct sweet_pool_t sweet_surf_pool;     /* cached: surfaces (their seeds push the caches, HakiosGPU.cpp) */
+ static struct sweet_pool_t sweet_gpu_pool;      /* write-combined: HakiosGPU's own buffers, as the VM's would be */
+ #define sweet_pool (sweet_surf_pool.mem)
+@@ -254,7 +256,9 @@ sweet_pool_buffer(uint64_t want, uint8_t **kernel, uint64_t *phys)
+ 	*kernel = sweet_gpu_pool.kernel + off;
+ 	*phys = sweet_gpu_pool.phys + off;
+ 	bzero(*kernel, (size_t)size);
+-	__builtin_arm_dsb(0xf);         /* (write-combined: the zeroes are in memory once this is done) */
++	/* (the kernel's view of the pool is cached whatever the descriptor's cache mode: clean and drop the zeroes) */
++	flush_dcache64((addr64_t)(uintptr_t)*kernel, (unsigned)size, FALSE);
++	__builtin_arm_dsb(0xf);
+ 	return m;
+ }
+ 
