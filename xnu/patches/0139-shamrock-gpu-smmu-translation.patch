@@ -1,0 +1,501 @@
+diff --git c/iokit/Kernel/arm/HakiosGPU.cpp i/iokit/Kernel/arm/HakiosGPU.cpp
+index cc45a05..78098bf 100644
+--- c/iokit/Kernel/arm/HakiosGPU.cpp
++++ i/iokit/Kernel/arm/HakiosGPU.cpp
+@@ -66,6 +66,7 @@ void hakios_gpu_address_free(uint64_t address, uint64_t size);
+ bool hakios_gpu_map(uint64_t address, uint64_t phys, bool read_only);
+ void hakios_gpu_mapped(void);
+ void hakios_gpu_unmap(uint64_t address, uint64_t size);
++bool hakios_gpu_smmu(void);
+ void hakios_gpu_to_memory(void * start, uint64_t size);
+ uint32_t hakios_gpu_submit(const uint64_t * addresses, const uint32_t * words, uint32_t count);
+ extern uint32_t gpu_log;
+@@ -651,12 +652,34 @@ HakiosGPUUserClient::newBuffer(IOMemoryDescriptor * memory, uint64_t from, uint6
+ 		IOLog("HakiosGPU: no handles left for a buffer of %llu bytes\n", size);
+ 		return NULL;
+ 	}
+-	/*
+-	 * shamrock: the A405's SMMU (iommu@1f08000) is left in bypass by the boot chain, so the GPU sees
+-	 * physical memory. A buffer is usable only if it is physically contiguous; its GPU address is
+-	 * its physical address (and must be below 4 GiB: the A4xx takes 32-bit addresses).
+-	 */
+-	{
++	if (hakios_gpu_smmu()) {
++		/*
++		 * shamrock: the GPU SMMU translates (SweetAdreno.cpp, context bank 0): the buffer gets GPU
++		 * addresses of its own and its pages are entered one by one, as HackiOS's driver does.
++		 */
++		if ((b->address = hakios_gpu_address(size)) == 0) {
++			IOLog("HakiosGPU: no GPU addresses left for a buffer of %llu bytes\n", size);
++			return NULL;
++		}
++		for (uint64_t offset = 0; offset < size && mapped; offset += 4096) {
++			IOByteCount length = 0;
++			addr64_t phys = memory->getPhysicalSegment(from + offset, &length, kIOMemoryMapperNone);
++
++			mapped = phys != 0 && hakios_gpu_map(b->address + offset, phys, flags & MSM_BO_GPU_READONLY);
++		}
++		hakios_gpu_mapped();
++		if (!mapped) {
++			hakios_gpu_unmap(b->address, size);
++			hakios_gpu_address_free(b->address, size);
++			IOLog("HakiosGPU: a buffer of %llu bytes cannot be entered into the GPU's address space\n", size);
++			return NULL;
++		}
++	} else {
++		/*
++		 * shamrock: the A405's SMMU (iommu@1f08000) left in bypass (no TZ restore, or it failed), so the
++		 * GPU sees physical memory. A buffer is usable only if it is physically contiguous; its GPU
++		 * address is its physical address (and must be below 4 GiB: the A4xx takes 32-bit addresses).
++		 */
+ 		IOByteCount length = 0;
+ 		addr64_t first = memory->getPhysicalSegment(from, &length, kIOMemoryMapperNone);
+ 
+diff --git c/iokit/Kernel/arm/SweetAdreno.cpp i/iokit/Kernel/arm/SweetAdreno.cpp
+index 9705f6d..551f7c1 100644
+--- c/iokit/Kernel/arm/SweetAdreno.cpp
++++ i/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -63,6 +63,11 @@ static volatile uint32_t *g_gcc;
+ static volatile uint32_t *g_gpu;
+ static volatile uint32_t *g_ring;
+ static uint64_t g_ring_phys;
++static uint64_t g_ring_gpu;            /* what the CP is given: == g_ring_phys in bypass */
++/* The GPU writes each submission's fence here (CP_EVENT_WRITE CACHE_FLUSH_TS), as Linux's a4xx does. */
++static volatile uint32_t g_fence_mem[16] __attribute__((aligned(64)));
++static uint64_t g_fence_phys;
++static uint64_t g_fence_gpu;           /* the fence word's GPU address: == g_fence_phys in bypass */
+ static uint32_t g_ring_wptr = 0;
+ static uint32_t g_fence = 0;
+ static bool g_ready = false;
+@@ -130,7 +135,7 @@ static bool power_on_oxili(void)
+ 	 * 2. Vote for GPU SMMU TCU/TBU & GTCU AHB clocks in APCS_SMMU_VOTE (0x4500c)
+ 	 *    to prevent memory transaction stalls on the system bus.
+ 	 */
+-	gcc_write(APCS_SMMU_VOTE, gcc_read(APCS_SMMU_VOTE) | (1u << 13) | (1u << 3) | (1u << 2));
++	gcc_write(APCS_SMMU_VOTE, gcc_read(APCS_SMMU_VOTE) | (1u << 13) | (1u << 12) | (1u << 3) | (1u << 2));  /* gtcu_ahb, smmu_cfg (the SMMU's iface clock), gfx_tbu, gfx_tcu */
+ 
+ 	/*
+ 	 * 3. Configure GFX3D root clock (GFX3D_CLK_SRC):
+@@ -252,7 +257,7 @@ static bool a4xx_hw_init(void)
+ 
+ 	/* 8192 words (4096 quadwords) -> ilog2(4096) = 12 = 0x0c */
+ 	gpu_write(REG_A4XX_CP_RB_CNTL, 0x0000000c | (1 << 27));
+-	gpu_write(REG_A4XX_CP_RB_BASE, (uint32_t)g_ring_phys);
++	gpu_write(REG_A4XX_CP_RB_BASE, (uint32_t)g_ring_gpu);
+ 
+ 	/* Load PM4 ucode */
+ 	gpu_write(REG_A4XX_CP_ME_RAM_WADDR, 0);
+@@ -350,11 +355,305 @@ void hakios_gpu_to_memory(void *start, uint64_t size);
+ uint32_t hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
+ bool hakios_gpu_done(uint32_t fence);
+ 
+-uint64_t hakios_gpu_address(uint64_t size) { (void)size; return 0; }
+-void hakios_gpu_address_free(uint64_t address, uint64_t size) { (void)address; (void)size; }
+-bool hakios_gpu_map(uint64_t address, uint64_t phys, bool read_only) { (void)address; (void)phys; (void)read_only; return true; }
+-void hakios_gpu_mapped(void) {}
+-void hakios_gpu_unmap(uint64_t address, uint64_t size) { (void)address; (void)size; }
++bool hakios_gpu_smmu(void);
++
++/*
++ * The GPU SMMU (iommu@1f08000, qcom,msm-iommu-v2, secure-id 18), context bank 0 = gfx3d_user
++ * (non-secure, ASID 0) at 0x1f08000. The global registers belong to TrustZone; as mainline
++ * qcom_iommu.c we ask TZ to restore the block's secure configuration (SCM MP_RESTORE_SEC_CFG,
++ * device 18; ios-river does the same for msm8953's gpu_iommu), then program CB0 with our own
++ * stage-1 tables, io-pgtable ARM_32_LPAE_S1 style (ias 32, 4 KiB granule, non-coherent walk):
++ *   - HakiosGPU's buffers at [GPU_VA_BASE, GPU_VA_END), 4 KiB pages, any physical layout;
++ *   - the kernel's own ring and fence word get GPU addresses from the same allocator (g_ring_gpu,
++ *     g_fence_gpu), so nothing depends on where xnu's RAM is (it may start at 0x20000000).
++ * If TZ refuses, or the CP cannot start with translation on, CB0 is turned off again and the GPU
++ * stays in bypass (contiguous buffers, the pools). sweetsmmu=0 skips it.
++ */
++#define SHAMROCK_SMMU_CB0_PA 0x01f08000ULL
++#define CB_SCTLR        0x00
++#define CB_TCR2         0x10
++#define CB_TTBR0        0x20
++#define CB_TTBR1        0x28
++#define CB_TCR          0x30
++#define CB_MAIR0        0x38
++#define CB_MAIR1        0x3c
++#define CB_FSR          0x58
++#define CB_FAR          0x60
++#define CB_FSYNR0       0x68
++#define CB_TLBIASID     0x610
++#define CB_TLBSYNC      0x7f0
++#define CB_TLBSTATUS    0x7f4
++#define PTE_ATTRS       ((1ULL << 11) | (1ULL << 10) | (2ULL << 8) | (1ULL << 6))      /* nG AF SH-outer AP-user, AttrIndx 0 (NC) */
++#define PTE_RO          (2ULL << 6)
++#define GPU_VA_BASE     0x01000000ULL
++#define GPU_VA_END      0x41000000ULL                   /* 1 GiB of GPU addresses for buffers */
++#define GPU_VA_GRAIN    0x10000ULL                      /* allocator granule: 64 KiB */
++#define GPU_VA_GRAINS   ((GPU_VA_END - GPU_VA_BASE) / GPU_VA_GRAIN)
++#define GMMU_L3_TABLES  ((GPU_VA_END - GPU_VA_BASE) >> 21)  /* 512: one per 2 MiB of buffer addresses */
++#define GMMU_TABLES     (1 + 4 + GMMU_L3_TABLES)        /* L1, the four L2s, the L3s */
++
++static uint64_t g_gmmu[GMMU_TABLES][512] __attribute__((aligned(4096)));
++static uint64_t g_gmmu_pa;
++static uint32_t g_gmmu_l3_used;
++static uint16_t g_gmmu_l3_of[GMMU_L3_TABLES];          /* L3 table index + 1 for each 2 MiB of buffer addresses */
++static uint8_t g_gpu_va_map[GPU_VA_GRAINS / 8];
++static volatile uint32_t *g_cb0;
++static bool g_smmu_on;
++static uint64_t g_gmmu_dirty_lo = ~0ULL, g_gmmu_dirty_hi;
++
++static inline void cb_write(uint32_t off, uint32_t v) { g_cb0[off / 4] = v; }
++static inline uint32_t cb_read(uint32_t off) { return g_cb0[off / 4]; }
++
++/* Qualcomm SCM call as qcom_scm-smc.c (SMCCC standard call, SIP owner); x0 == 1: interrupted, again. */
++static int64_t
++sweet_scm(bool smc64, uint32_t svc, uint32_t cmd, uint64_t arginfo, uint64_t a0, uint64_t a1, uint64_t *r1)
++{
++	register uint64_t x0 __asm__("x0") = (smc64 ? 0x42000000ULL : 0x02000000ULL) | ((svc & 0xff) << 8) | (cmd & 0xff);
++	register uint64_t x1 __asm__("x1") = arginfo;
++	register uint64_t x2 __asm__("x2") = a0;
++	register uint64_t x3 __asm__("x3") = a1;
++	register uint64_t x4 __asm__("x4") = 0;
++	register uint64_t x5 __asm__("x5") = 0;
++	do {
++		__asm__ volatile ("smc #0"
++		    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5)
++		    :
++		    : "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++	} while (x0 == 1);
++	if (r1) {
++		*r1 = x1;
++	}
++	return (int64_t)x0;
++}
++
++static void
++gmmu_dirty(void *p, size_t n)
++{
++	uint64_t a = (uint64_t)p;
++	if (a < g_gmmu_dirty_lo) g_gmmu_dirty_lo = a;
++	if (a + n > g_gmmu_dirty_hi) g_gmmu_dirty_hi = a + n;
++}
++
++static void
++gmmu_sync(void)
++{
++	if (g_gmmu_dirty_hi > g_gmmu_dirty_lo) {
++		flush_dcache64(g_gmmu_dirty_lo, (unsigned)(g_gmmu_dirty_hi - g_gmmu_dirty_lo), 0);
++	}
++	g_gmmu_dirty_lo = ~0ULL;
++	g_gmmu_dirty_hi = 0;
++	__builtin_arm_dsb(0xf);
++	cb_write(CB_TLBIASID, 0);
++	cb_write(CB_TLBSYNC, 0);
++	__builtin_arm_dsb(0xf);
++	for (int i = 0; i < 1000 && (cb_read(CB_TLBSTATUS) & 1); i++) {
++		delay(1);
++	}
++}
++
++static uint64_t *
++gmmu_l3(uint64_t va, bool make)
++{
++	uint32_t slot = (uint32_t)((va - GPU_VA_BASE) >> 21);
++	if (g_gmmu_l3_of[slot] == 0) {
++		if (!make || g_gmmu_l3_used >= GMMU_L3_TABLES) {
++			return NULL;
++		}
++		uint32_t t = 5 + g_gmmu_l3_used++;
++		g_gmmu_l3_of[slot] = (uint16_t)(t + 1);
++		uint64_t *l2 = g_gmmu[1 + (va >> 30)];
++		l2[(va >> 21) & 511] = (g_gmmu_pa + (uint64_t)t * 4096) | 3;     /* table */
++		gmmu_dirty(&l2[(va >> 21) & 511], 8);
++	}
++	return g_gmmu[g_gmmu_l3_of[slot] - 1];
++}
++
++static void gmmu_off(const char *why);
++
++/* Turn CB0 on; false: TZ or the SMMU said no (CB0 left off, bypass). */
++static bool
++gmmu_init(void)
++{
++	int on = 1;
++	uint64_t avail = 0, res = ~0ULL;
++
++	PE_parse_boot_argn("sweetsmmu", &on, sizeof(on));
++	if (!on) {
++		IOLog("SWEET A405: GPU SMMU left in bypass (sweetsmmu=0)\n");
++		return false;
++	}
++	/* which SMC convention, and is restore_sec_cfg there (as qcom_scm's __get_convention probe) */
++	bool smc64 = true;
++	int64_t st = sweet_scm(true, 0x06, 0x01, 1, 0x02000c02ULL, 0, &avail);
++	if (st != 0) {
++		int64_t st32 = sweet_scm(false, 0x06, 0x01, 1, 0x02000c02ULL, 0, &avail);
++		IOLog("SWEET A405: SCM SMC64 probe %lld, SMC32 probe %lld (avail %llu)\n", st, st32, avail);
++		if (st32 != 0) {
++			IOLog("SWEET A405: no usable SCM convention: GPU SMMU left in bypass\n");
++			return false;
++		}
++		smc64 = false;
++	}
++	st = sweet_scm(smc64, 0x0c, 0x02, 2, 18, 0, &res);
++	IOLog("SWEET A405: SCM %s: restore_sec_cfg available %llu; restore(18, 0) status %lld result %#llx\n",
++	    smc64 ? "SMC64" : "SMC32", avail, st, res);
++	if (st != 0 || res != 0) {
++		IOLog("SWEET A405: TZ did not restore the GPU SMMU: left in bypass\n");
++		return false;
++	}
++	g_cb0 = (volatile uint32_t *)ml_io_map(SHAMROCK_SMMU_CB0_PA, 0x1000);
++	if (g_cb0 == NULL) {
++		return false;
++	}
++	IOLog("SWEET A405: GPU SMMU CB0 before: SCTLR %#x TCR %#x FSR %#x\n", cb_read(CB_SCTLR), cb_read(CB_TCR), cb_read(CB_FSR));
++
++	g_gmmu_pa = kvtophys((uint64_t)&g_gmmu[0][0]);
++	/* (one static array in the kernel image: physically contiguous) */
++	for (uint32_t i = 1; i < GMMU_TABLES; i++) {
++		if (kvtophys((uint64_t)&g_gmmu[i][0]) != g_gmmu_pa + (uint64_t)i * 4096) {
++			IOLog("SWEET A405: GPU page tables not contiguous at %u: SMMU left in bypass\n", i);
++			return false;
++		}
++	}
++	bzero(g_gmmu, sizeof(g_gmmu));
++	for (uint32_t i = 0; i < 4; i++) {
++		g_gmmu[0][i] = (g_gmmu_pa + (1 + i) * 4096ULL) | 3;
++	}
++	flush_dcache64((uint64_t)g_gmmu, sizeof(g_gmmu), 0);
++
++	cb_write(CB_SCTLR, 0);
++	cb_write(CB_FAR, 0);
++	cb_write(CB_FAR + 4, 0);
++	cb_write(CB_FSR, cb_read(CB_FSR));
++	cb_write(CB_TTBR0, (uint32_t)g_gmmu_pa);
++	cb_write(CB_TTBR0 + 4, (uint32_t)(g_gmmu_pa >> 32));     /* ASID 0 */
++	cb_write(CB_TTBR1, 0);
++	cb_write(CB_TTBR1 + 4, 0);
++	cb_write(CB_TCR2, (7u << 15) | 2u);                     /* SEP upstream, PASIZE 40 bit */
++	cb_write(CB_TCR, (1u << 31) | (1u << 23) | (2u << 12) | 32u);     /* EAE, EPD1, SH0 outer, T0SZ 32 */
++	cb_write(CB_MAIR0, 0xf404ff44);
++	cb_write(CB_MAIR1, 0);
++	__builtin_arm_dsb(0xf);
++	gmmu_sync();
++	cb_write(CB_SCTLR, (1u << 12) | (1u << 6) | (1u << 5) | (1u << 2) | (1u << 1) | 1u);      /* ASIDPNE CFIE CFRE AFE TRE M */
++	__builtin_arm_dsb(0xf);
++	g_smmu_on = true;
++	/* the ring and the fence word, which the CP is given directly */
++	g_ring_gpu = hakios_gpu_address(RING_SIZE);
++	g_fence_gpu = hakios_gpu_address(4096);
++	bool ok = g_ring_gpu != 0 && g_fence_gpu != 0;
++	for (uint64_t o = 0; ok && o < RING_SIZE; o += 4096) {
++		ok = hakios_gpu_map(g_ring_gpu + o, kvtophys((uint64_t)g_ring + o), true);
++	}
++	ok = ok && hakios_gpu_map(g_fence_gpu, g_fence_phys & ~0xfffULL, false);
++	g_fence_gpu += ok ? (g_fence_phys & 0xfffULL) : 0;
++	gmmu_sync();
++	if (!ok) {
++		gmmu_off("no GPU addresses for the ring");
++		return false;
++	}
++	IOLog("SWEET A405: GPU SMMU CB0 translating: TTBR0 %#llx SCTLR %#x TCR %#x FSR %#x; ring %#llx -> GPU %#llx, fence %#llx -> GPU %#llx, buffers at %#llx-%#llx\n",
++	    g_gmmu_pa, cb_read(CB_SCTLR), cb_read(CB_TCR), cb_read(CB_FSR), g_ring_phys, g_ring_gpu, g_fence_phys, g_fence_gpu, GPU_VA_BASE, GPU_VA_END);
++	return true;
++}
++
++static void
++gmmu_off(const char *why)
++{
++	if (!g_smmu_on) {
++		return;
++	}
++	IOLog("SWEET A405: GPU SMMU off again (%s): FSR %#x FAR %#x%08x FSYNR0 %#x\n", why,
++	    cb_read(CB_FSR), cb_read(CB_FAR + 4), cb_read(CB_FAR), cb_read(CB_FSYNR0));
++	cb_write(CB_SCTLR, 0);
++	cb_write(CB_FSR, cb_read(CB_FSR));
++	__builtin_arm_dsb(0xf);
++	g_smmu_on = false;
++	g_ring_gpu = g_ring_phys;
++	g_fence_gpu = g_fence_phys;
++}
++
++bool hakios_gpu_smmu(void) { return g_smmu_on; }
++
++uint64_t
++hakios_gpu_address(uint64_t size)
++{
++	uint64_t n = (size + GPU_VA_GRAIN - 1) / GPU_VA_GRAIN;
++	uint64_t run = 0;
++
++	if (!g_smmu_on || n == 0) {
++		return 0;
++	}
++	for (uint64_t i = 0; i < GPU_VA_GRAINS; i++) {
++		if (g_gpu_va_map[i / 8] & (1u << (i % 8))) {
++			run = 0;
++			continue;
++		}
++		if (++run == n) {
++			uint64_t first = i + 1 - n;
++			for (uint64_t j = first; j <= i; j++) {
++				g_gpu_va_map[j / 8] |= (uint8_t)(1u << (j % 8));
++			}
++			return GPU_VA_BASE + first * GPU_VA_GRAIN;
++		}
++	}
++	return 0;
++}
++
++void
++hakios_gpu_address_free(uint64_t address, uint64_t size)
++{
++	if (address < GPU_VA_BASE || address >= GPU_VA_END) {
++		return;                 /* (a physical address from bypass mode) */
++	}
++	uint64_t first = (address - GPU_VA_BASE) / GPU_VA_GRAIN;
++	uint64_t n = (size + GPU_VA_GRAIN - 1) / GPU_VA_GRAIN;
++	for (uint64_t j = first; j < first + n && j < GPU_VA_GRAINS; j++) {
++		g_gpu_va_map[j / 8] &= (uint8_t)~(1u << (j % 8));
++	}
++}
++
++bool
++hakios_gpu_map(uint64_t address, uint64_t phys, bool read_only)
++{
++	if (!g_smmu_on || address < GPU_VA_BASE || address >= GPU_VA_END || (address & 0xfff) || (phys & 0xfff)) {
++		return false;
++	}
++	uint64_t *l3 = gmmu_l3(address, true);
++	if (l3 == NULL) {
++		return false;
++	}
++	uint64_t *pte = &l3[(address >> 12) & 511];
++	*pte = phys | PTE_ATTRS | (read_only ? PTE_RO : 0) | 3;
++	gmmu_dirty(pte, 8);
++	return true;
++}
++
++void
++hakios_gpu_mapped(void)
++{
++	if (g_smmu_on) {
++		gmmu_sync();
++	}
++}
++
++void
++hakios_gpu_unmap(uint64_t address, uint64_t size)
++{
++	if (!g_smmu_on || address < GPU_VA_BASE || address >= GPU_VA_END) {
++		return;
++	}
++	for (uint64_t o = 0; o < size && address + o < GPU_VA_END; o += 4096) {
++		uint64_t *l3 = gmmu_l3(address + o, false);
++		if (l3 != NULL) {
++			uint64_t *pte = &l3[((address + o) >> 12) & 511];
++			*pte = 0;
++			gmmu_dirty(pte, 8);
++		}
++	}
++	gmmu_sync();
++}
++
+ void hakios_gpu_to_memory(void *start, uint64_t size)
+ {
+ 	if (start == NULL || size == 0) {
+@@ -364,9 +663,6 @@ void hakios_gpu_to_memory(void *start, uint64_t size)
+ 	flush_dcache64((uint64_t)start, (unsigned)size, 0);
+ }
+ 
+-/* The GPU writes each submission's fence here (CP_EVENT_WRITE CACHE_FLUSH_TS), as Linux's a4xx does. */
+-static volatile uint32_t g_fence_mem[16] __attribute__((aligned(64)));
+-static uint64_t g_fence_phys;
+ static uint32_t g_submits;
+ static uint64_t g_submit_started;
+ 
+@@ -395,9 +691,6 @@ ring_reserve(uint32_t n)
+ uint32_t hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
+ {
+ 	if (!g_ready || count == 0) return 0;
+-	if (g_fence_phys == 0) {
+-		g_fence_phys = kvtophys((uint64_t)g_fence_mem);
+-	}
+ 	if (!ring_reserve(count * 4 + 16)) {
+ 		IOLog("SWEET A405: ring full (rptr %u wptr %u): GPU not consuming\n", gpu_read(REG_A4XX_CP_RB_RPTR), g_ring_wptr);
+ 		return 0;
+@@ -418,7 +711,7 @@ uint32_t hakios_gpu_submit(const uint64_t *addresses, const uint32_t *words, uin
+ 	ring_out(0x00000000);
+ 	ring_out(pm4_pkt3(CP_EVENT_WRITE, 3));
+ 	ring_out(CACHE_FLUSH_TS);
+-	ring_out((uint32_t)g_fence_phys);
++	ring_out((uint32_t)g_fence_gpu);
+ 	ring_out(g_fence);
+ 	ring_flush();
+ 	if (g_submits++ == 0) {
+@@ -433,6 +726,36 @@ bool hakios_gpu_done(uint32_t fence)
+ 	return (int32_t)(fence_read() - fence) >= 0;
+ }
+ 
++/*
++ * After CP_ME_INIT: can the CP write memory (through the SMMU when it translates)? One
++ * CACHE_FLUSH_TS of a marker to the fence word, as every submission ends.
++ */
++static bool
++cp_selftest(void)
++{
++	g_fence_mem[0] = 0;
++	flush_dcache64((uint64_t)g_fence_mem, sizeof(g_fence_mem), 0);
++	if (!ring_reserve(8)) {
++		return false;
++	}
++	ring_out(pm4_pkt3(CP_EVENT_WRITE, 3));
++	ring_out(CACHE_FLUSH_TS);
++	ring_out((uint32_t)g_fence_gpu);
++	ring_out(0x5e1f7e57);
++	ring_flush();
++	for (int i = 0; i < 2000; i++) {
++		if (fence_read() == 0x5e1f7e57) {
++			g_fence_mem[0] = 0;
++			flush_dcache64((uint64_t)g_fence_mem, sizeof(g_fence_mem), 0);
++			return true;
++		}
++		delay(100);
++	}
++	IOLog("SWEET A405: CP self-test: fence word %#x (expected 0x5e1f7e57), rptr %u wptr %u RBBM_STATUS %#x\n",
++	    fence_read(), gpu_read(REG_A4XX_CP_RB_RPTR), g_ring_wptr, gpu_read(REG_A4XX_RBBM_STATUS));
++	return false;
++}
++
+ /* Statistics for HakiosGPU.cpp's report; only submissions are counted here. */
+ void hakios_gpu_worked(uint64_t *microseconds, uint32_t *submissions, uint32_t by[7])
+ {
+@@ -515,17 +838,34 @@ SweetAdreno::start(IOService *provider)
+ 	static uint32_t s_rb[RING_WORDS] __attribute__((aligned(4096)));
+ 	g_ring = s_rb;
+ 	g_ring_phys = kvtophys((uint64_t)g_ring);
++	g_fence_phys = kvtophys((uint64_t)g_fence_mem);
++	g_ring_gpu = g_ring_phys;               /* (bypass until gmmu_init() says otherwise) */
++	g_fence_gpu = g_fence_phys;
+ 	gGPULock = IOLockAlloc();
+ 
+-	if (!power_on_oxili() || !a4xx_hw_init()) {
++	if (!power_on_oxili()) {
+ 		IOLog("SWEET A405: hardware initialization failed\n");
+ 		return false;
+ 	}
++	(void)gmmu_init();
++	if (!a4xx_hw_init() || (g_smmu_on && !cp_selftest())) {
++		if (!g_smmu_on) {
++			IOLog("SWEET A405: hardware initialization failed\n");
++			return false;
++		}
++		/* the CP could not start through the SMMU: try once more in bypass */
++		gmmu_off("CP_ME_INIT or the CP self-test failed with translation on");
++		g_ring_wptr = 0;
++		if (!a4xx_hw_init()) {
++			IOLog("SWEET A405: hardware initialization failed (also in bypass)\n");
++			return false;
++		}
++	}
+ 
+ 	g_ready = true;
+ 	(void)gGPULock;
+ 	HakiosGPUStart();
+-	IOLog("SWEET A405: ready; HakiosGPU service started (HakiosGPU.cpp, SMMU bypass, contiguous buffers)\n");
++	IOLog("SWEET A405: ready; HakiosGPU service started (HakiosGPU.cpp, %s)\n", g_smmu_on ? "GPU SMMU translating, any buffer" : "SMMU bypass, contiguous buffers");
+ 	return true;
+ }
+ 

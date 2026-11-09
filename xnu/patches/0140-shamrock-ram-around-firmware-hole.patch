@@ -1,0 +1,186 @@
+diff --git c/osfmk/arm/pmap/pmap.c i/osfmk/arm/pmap/pmap.c
+index f297f47..472c6a0 100644
+--- c/osfmk/arm/pmap/pmap.c
++++ i/osfmk/arm/pmap/pmap.c
+@@ -40,6 +40,7 @@
+ #include <mach/boolean.h>
+ #include <kern/bits.h>
+ #include <kern/ecc.h>
++#include <arm64/shamrock_phys.h>
+ #include <kern/thread.h>
+ #include <kern/sched.h>
+ #include <kern/zalloc.h>
+@@ -2578,7 +2579,12 @@ static bool need_ram_ranges_init = true;
+ bool
+ pmap_is_bad_ram(__unused ppnum_t ppn)
+ {
++#if defined(SWEET)
++	/* shamrock: firmware hole inside the RAM range; pmap_startup keeps it off the free lists */
++	return shamrock_phys_hole(ptoa(ppn));
++#else
+ 	return false;
++#endif
+ }
+ 
+ /**
+diff --git c/osfmk/arm/pmap/pmap_data.h i/osfmk/arm/pmap/pmap_data.h
+index 2883f63..239ee1c 100644
+--- c/osfmk/arm/pmap/pmap_data.h
++++ i/osfmk/arm/pmap/pmap_data.h
+@@ -38,6 +38,7 @@
+ 
+ #include <kern/ledger.h>
+ #include <mach/vm_types.h>
++#include <arm64/shamrock_phys.h>
+ #include <mach_assert.h>
+ #include <vm/vm_page.h>
+ 
+@@ -74,6 +75,12 @@ extern pmap_paddr_t vm_first_phys, vm_last_phys;
+ static inline bool
+ pa_valid(pmap_paddr_t pa)
+ {
++#if defined(SWEET)
++	/* shamrock: the firmware hole inside the RAM range behaves as I/O */
++	if (shamrock_phys_hole(pa)) {
++		return false;
++	}
++#endif
+ 	return (pa >= vm_first_phys) && (pa < vm_last_phys);
+ }
+ 
+diff --git c/osfmk/arm64/arm_vm_init.c i/osfmk/arm64/arm_vm_init.c
+index dc0398f..f6d3679 100644
+--- c/osfmk/arm64/arm_vm_init.c
++++ i/osfmk/arm64/arm_vm_init.c
+@@ -51,6 +51,7 @@
+ #include <libkern/section_keywords.h>
+ 
+ #include <san/kasan.h>
++#include <arm64/shamrock_phys.h>
+ 
+ #if __ARM_KERNEL_PROTECT__
+ /*
+@@ -1600,8 +1601,28 @@ arm_vm_physmap_init(boot_args *args)
+ 	arm_vm_page_granular_RWNX(end_kern, phystokv(args->topOfKernelData) - end_kern,
+ 	    ARM64_GRANULE_ALLOW_BLOCK | ARM64_GRANULE_ALLOW_HINT); /* Device Tree (if not locked down), RAM Disk (if present), bootArgs */
+ 
++#if defined(SWEET)
++	/* shamrock: the rest of physmem, one entry per stretch between firmware holes (left unmapped) */
++	{
++		pmap_paddr_t chunk = args->topOfKernelData;
++		for (int h = 0; h <= SHAMROCK_PHYS_HOLES; h++) {
++			pmap_paddr_t chunk_end = (h < SHAMROCK_PHYS_HOLES) ? shamrock_phys_holes[h].start : real_avail_end;
++			if (chunk_end > real_avail_end) {
++				chunk_end = real_avail_end;
++			}
++			if (chunk_end > chunk) {
++				arm_vm_physmap_slide(temp_ptov_table, (chunk - gPhysBase + gVirtBase), chunk_end - chunk,
++				    AP_RWNA, ARM64_GRANULE_ALLOW_BLOCK | ARM64_GRANULE_ALLOW_HINT);
++			}
++			if (h < SHAMROCK_PHYS_HOLES && shamrock_phys_holes[h].end > chunk) {
++				chunk = shamrock_phys_holes[h].end;
++			}
++		}
++	}
++#else
+ 	arm_vm_physmap_slide(temp_ptov_table, (args->topOfKernelData - gPhysBase + gVirtBase),
+ 	    real_avail_end - args->topOfKernelData, AP_RWNA, ARM64_GRANULE_ALLOW_BLOCK | ARM64_GRANULE_ALLOW_HINT); // rest of physmem
++#endif
+ 
+ 	assert((temp_ptov_table[ptov_index - 1].va + temp_ptov_table[ptov_index - 1].len) <= physmap_end);
+ 
+diff --git c/osfmk/arm64/shamrock_phys.h i/osfmk/arm64/shamrock_phys.h
+new file mode 100644
+index 0000000..1d35393
+--- /dev/null
++++ i/osfmk/arm64/shamrock_phys.h
+@@ -0,0 +1,42 @@
++/*
++ * SHAMROCK (MSM8952, 3 GB) physical memory holes inside xnu's RAM range.
++ *
++ * lk2nd's FDT memory node is <0x20000000 0x60000000>, <0x80000000 0x60000000>: one run of DRAM
++ * from 0x20000000 to 0xe0000000. Firmware owns the start of the upper bank: TZ/QSEE, SMEM,
++ * modem (mpss 0x86c00000), LPASS (to 0x8da00000), lk2nd and its boot buffers, the boot splash
++ * at 0x83200000 and our own scanout buffer at 0x90000000-0x91000000. With an ADT dram range
++ * that starts at 0x20000000 (shamrock-d21-*-full.adt), that span is a hole: pa_valid() is false
++ * (the pmap treats it as I/O, so ml_io_map of the scanout buffer still works), pmap_is_bad_ram()
++ * keeps its vm_pages off the free lists, and the physmap leaves it unmapped so the CPU never
++ * speculates into TrustZone-protected memory. As ios-river's 0205 for the Moto G7.
++ *
++ * With the old ADT (RAM from 0x91000000) the hole lies below RAM and changes nothing.
++ */
++#ifndef _ARM64_SHAMROCK_PHYS_H_
++#define _ARM64_SHAMROCK_PHYS_H_
++
++#if defined(SWEET)
++#include <stdint.h>
++#include <stdbool.h>
++
++#define SHAMROCK_PHYS_HOLES 1
++
++static const struct {
++	uint64_t start, end;
++} shamrock_phys_holes[SHAMROCK_PHYS_HOLES] = {
++	{ 0x80000000ULL, 0x91000000ULL },
++};
++
++static inline bool
++shamrock_phys_hole(uint64_t pa)
++{
++	for (int i = 0; i < SHAMROCK_PHYS_HOLES; i++) {
++		if (pa >= shamrock_phys_holes[i].start && pa < shamrock_phys_holes[i].end) {
++			return true;
++		}
++	}
++	return false;
++}
++#endif /* SWEET */
++
++#endif /* _ARM64_SHAMROCK_PHYS_H_ */
+diff --git c/osfmk/vm/vm_resident.c i/osfmk/vm/vm_resident.c
+index 0aab8cc..6c9b5da 100644
+--- c/osfmk/vm/vm_resident.c
++++ i/osfmk/vm/vm_resident.c
+@@ -640,6 +640,7 @@ vm_page_set_colors( void )
+ static boolean_t fill = FALSE;
+ static unsigned int fillval;
+ uint_t vm_delayed_count = 0;    /* when non-zero, indicates we may have more pages to init */
++static unsigned int vm_page_bad_ram_count = 0;  /* shamrock: vm_pages[] entries of pmap_is_bad_ram() pages */
+ ppnum_t delay_above_pnum = PPNUM_MAX;
+ 
+ /*
+@@ -1321,6 +1322,11 @@ pmap_steal_memory_internal(
+ 		if (!pmap_next_page_hi(&phys_page, might_free)) {
+ 			panic("pmap_steal_memory() size: 0x%llx", (uint64_t)size);
+ 		}
++#if defined(__arm64__)
++		if (pmap_is_bad_ram(phys_page)) {
++			panic("pmap_steal_memory() reached a page that is not RAM: 0x%x", phys_page);
++		}
++#endif
+ 
+ #if defined(__x86_64__)
+ 		pmap_pre_expand(kernel_pmap, map_addr);
+@@ -1567,6 +1573,14 @@ pmap_startup(
+ #endif
+ 		++vm_pages_count;
+ 		vm_page_init(&vm_pages[i], phys_page, FALSE);
++#if defined(__arm64__)
++		if (pmap_is_bad_ram(phys_page)) {
++			/* shamrock: a firmware hole; vm_pages[] stays linear in physical pages, the page is never freed */
++			vm_pages[i].vmp_error = true;
++			++vm_page_bad_ram_count;
++			continue;
++		}
++#endif
+ 		if (fill) {
+ 			fillPage(phys_page, fillval);
+ 		}
+@@ -1586,6 +1600,7 @@ pmap_startup(
+ 
+ 	absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
+ 	printf("pmap_startup() init/release time: %lld microsec\n", (now_ns - start_ns) / NSEC_PER_USEC);
++	printf("pmap_startup() %u pages kept off the free lists (not usable RAM)\n", vm_page_bad_ram_count);
+ 	printf("pmap_startup() delayed init/release of %d pages\n", vm_delayed_count);
+ 
+ #if defined(__LP64__)
