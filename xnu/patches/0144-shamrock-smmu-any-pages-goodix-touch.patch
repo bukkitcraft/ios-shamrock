@@ -1,0 +1,198 @@
+diff --git c/bsd/dev/sweet_touch.c i/bsd/dev/sweet_touch.c
+index 2c26d3c..9a68119 100644
+--- c/bsd/dev/sweet_touch.c
++++ i/bsd/dev/sweet_touch.c
+@@ -115,6 +115,7 @@ static struct {
+ 	uint32_t down_mask;
+ 	uint16_t last_x[HX_MAX_FINGERS], last_y[HX_MAX_FINGERS];
+ 	uint32_t boot_cfg91, boot_io91, boot_cfg64, boot_io64;     /* as lk2nd left them */
++	uint8_t gt_addr;                /* the Goodix's address (0x14 or 0x5d); 0: the Himax at 0x48 */
+ } g_touch;
+ 
+ static inline uint32_t
+@@ -422,6 +423,91 @@ hx_poll(uint32_t *events)
+ 	return 0;
+ }
+ 
++/* Goodix GT9xx (Linux goodix.c): 16-bit big-endian register addresses */
++#define GT_REG_ID           0x8140u     /* product id, 4 ASCII bytes */
++#define GT_REG_CONFIG       0x8047u     /* config version, then x max (le16), y max (le16), max touches */
++#define GT_REG_COOR         0x814eu     /* status (bit 7 ready, bits 0-3 count), then 8 bytes a contact */
++#define GT_CONTACTS         5           /* 1 + 5 * 8 = 41 bytes a read, inside the QUP FIFO */
++
++static int
++gt_read(uint16_t reg, uint8_t *buf, uint32_t len)
++{
++	uint8_t a[2] = { (uint8_t)(reg >> 8), (uint8_t)reg };
++	int ret = qup_xfer(g_touch.gt_addr, false, a, 2);
++	return ret ? ret : qup_xfer(g_touch.gt_addr, true, buf, len);
++}
++
++static int
++gt_write_u8(uint16_t reg, uint8_t v)
++{
++	uint8_t a[3] = { (uint8_t)(reg >> 8), (uint8_t)reg, v };
++	return qup_xfer(g_touch.gt_addr, false, a, 3);
++}
++
++static void
++gt_config(void)
++{
++	uint8_t id[4] = { 0 }, cfg[8] = { 0 };
++	int e1 = gt_read(GT_REG_ID, id, 4);
++	int e2 = gt_read(GT_REG_CONFIG, cfg, sizeof(cfg));
++	unsigned x = (unsigned)cfg[1] | ((unsigned)cfg[2] << 8);
++	unsigned y = (unsigned)cfg[3] | ((unsigned)cfg[4] << 8);
++
++	g_touch.xres = (e2 == 0 && x) ? x : 1080;
++	g_touch.yres = (e2 == 0 && y) ? y : 1920;
++	g_touch.fingers = GT_CONTACTS;
++	printf("SHAMROCK TOUCH: Goodix at %#x: id '%c%c%c%c' (err %d), config version %#x, %u x %u, %u touches (err %d)\n",
++	    g_touch.gt_addr, id[0] ? id[0] : '?', id[1] ? id[1] : '?', id[2] ? id[2] : '?', id[3] ? id[3] : ' ', e1,
++	    cfg[0], g_touch.xres, g_touch.yres, cfg[5] & 0x0f, e2);
++	(void)gt_write_u8(GT_REG_COOR, 0);
++}
++
++static int
++gt_poll(uint32_t *events)
++{
++	uint8_t buf[1 + GT_CONTACTS * 8];
++	uint32_t pressed = 0;
++	int err = gt_read(GT_REG_COOR, buf, 1);
++
++	if (err) {
++		return err;
++	}
++	if (!(buf[0] & 0x80)) {
++		return 0;                       /* nothing new */
++	}
++	unsigned n = buf[0] & 0x0f;
++	if (n > GT_CONTACTS) {
++		n = GT_CONTACTS;
++	}
++	if (n > 0 && (err = gt_read(GT_REG_COOR, buf, 1 + n * 8))) {
++		return err;
++	}
++	for (unsigned i = 0; i < n; i++) {
++		const uint8_t *c = &buf[1 + i * 8];
++		unsigned id = c[0] & 0x0f;
++		if (id >= HX_MAX_FINGERS) {
++			continue;
++		}
++		unsigned x = (unsigned)c[1] | ((unsigned)c[2] << 8);
++		unsigned y = (unsigned)c[3] | ((unsigned)c[4] << 8);
++		int px = (int)(x * 1080u / g_touch.xres);
++		int py = (int)(y * 1920u / g_touch.yres);
++		g_touch.last_x[id] = (uint16_t)px;
++		g_touch.last_y[id] = (uint16_t)py;
++		sweet_hid_touch((int)id, 1, px, py);
++		pressed |= 1u << id;
++		(*events)++;
++	}
++	for (unsigned i = 0; i < HX_MAX_FINGERS; i++) {
++		if ((g_touch.down_mask & (1u << i)) && !(pressed & (1u << i))) {
++			sweet_hid_touch((int)i, 0, g_touch.last_x[i], g_touch.last_y[i]);
++			(*events)++;
++		}
++	}
++	g_touch.down_mask = pressed;
++	return gt_write_u8(GT_REG_COOR, 0);
++}
++
+ static void
+ shamrock_touch_thread(void *arg, wait_result_t result)
+ {
+@@ -438,25 +524,39 @@ shamrock_touch_thread(void *arg, wait_result_t result)
+ 	printf("SHAMROCK TOUCH: QUP io_mode %#x: out fifo %u, in fifo %u bytes; clk_ctl %#x\n",
+ 	    iomode, g_touch.out_fifo, g_touch.in_fifo, QUP_CLK_CTL_400K);
+ 
+-	/* until the Himax answers: each power/reset variant in turn, one every ~10 s (repeated, so a late stall dump has them) */
++	/*
++	 * Until a controller answers: each power/reset variant in turn, one every ~10 s. r47old: 0x14
++	 * answers after variants 0, 2 and 3 (a Goodix GT9xx: it takes 0x14 when INT is high as reset
++	 * is released), nothing at 0x48.
++	 */
+ 	{
+ 		int answers[4];
+ 		for (int v = 0;; v = (v + 1) % 4) {
+-			err = hx_power_variant(v, answers);
+-			if (err == 0) {
++			(void)hx_power_variant(v, answers);
++			if (answers[2] == 0 || answers[1] == 0) {
++				g_touch.gt_addr = answers[2] == 0 ? 0x14 : 0x5d;
++				printf("SHAMROCK TOUCH: Goodix answers at %#x after power variant %d\n", g_touch.gt_addr, v);
++				break;
++			}
++			if (answers[0] == 0) {
+ 				printf("SHAMROCK TOUCH: HX852x answers after power variant %d\n", v);
+ 				break;
+ 			}
+ 			touch_sleep_ms(10000);
+ 		}
+ 	}
+-	hx_config();
++	err = 0;
++	if (g_touch.gt_addr) {
++		gt_config();
++	} else {
++		hx_config();
++	}
+ 
+ 	for (;;) {
+-		touch_sleep_ms(err ? 1000 : 8);
++		touch_sleep_ms(8);
+ 		polls++;
+ 		if (err == 0) {
+-			int e = hx_poll(&events);
++			int e = g_touch.gt_addr ? gt_poll(&events) : hx_poll(&events);
+ 			if (e) {
+ 				bad++;
+ 				last = e;
+diff --git c/iokit/Kernel/arm/HakiosGPU.cpp i/iokit/Kernel/arm/HakiosGPU.cpp
+index 78098bf..fc9b7eb 100644
+--- c/iokit/Kernel/arm/HakiosGPU.cpp
++++ i/iokit/Kernel/arm/HakiosGPU.cpp
+@@ -823,13 +823,15 @@ HakiosGPUUserClient::gemNew(struct msm_gem_new * request)
+ 	uint8_t * kernel = NULL;
+ 	uint64_t phys = 0;
+ 	memory = NULL;
+-	if (size >= (512u << 10)) {
++	/* (with the GPU SMMU translating, any pages do: no pool, no contiguous run needed) */
++	bool smmu = hakios_gpu_smmu();
++	if (!smmu && size >= (512u << 10)) {
+ 		memory = sweet_pool_buffer(size, &kernel, &phys);
+ 	}
+ 	if (memory == NULL) {
+ 		/* (the memory comes zeroed, and making it write-combined pushes the zeroes out of the cache) */
+ 		IOBufferMemoryDescriptor * vm = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
+-		    kIOMemoryPhysicallyContiguous | (gGPUCached ? 0 : kIOMapWriteCombineCache), (vm_size_t) size, PAGE_SIZE);
++		    (smmu ? 0 : kIOMemoryPhysicallyContiguous) | (gGPUCached ? 0 : kIOMapWriteCombineCache), (vm_size_t) size, PAGE_SIZE);
+ 		memory = vm;
+ 		if (vm != NULL) {
+ 			kernel = (uint8_t *) vm->getBytesNoCopy();
+@@ -838,12 +840,12 @@ HakiosGPUUserClient::gemNew(struct msm_gem_new * request)
+ 			}
+ 		}
+ 	}
+-	if (memory == NULL && size < (512u << 10)) {
++	if (memory == NULL && (smmu || size < (512u << 10))) {
+ 		memory = sweet_pool_buffer(size, &kernel, &phys);
+ 	}
+ 	if (memory == NULL) {
+-		IOLog("HakiosGPU: no memory for a buffer of %llu bytes (%u buffers, %llu MB with this client)\n", size, fBufferCount,
+-		    fBufferBytes >> 20);
++		IOLog("HakiosGPU: no memory for a buffer of %llu bytes (%u buffers, %llu MB with this client; GPU SMMU %s)\n", size, fBufferCount,
++		    fBufferBytes >> 20, smmu ? "on" : "off (bypass)");
+ 		return kIOReturnNoMemory;
+ 	}
+ 	(void) phys;                                    /* (newBuffer() finds it again, and checks it) */
+@@ -1189,7 +1191,8 @@ HakiosGPUUserClient::submit(struct msm_gem_submit * request)
+ 		uint64_t making;
+ 
+ 		absolutetime_to_nanoseconds(gGPUStat.making, &making);
+-		IOLog("HakiosGPU: buffers: %u made in %llu us each, %u kept ones given again (%llu MB kept)\n", gGPUStat.made,
++		IOLog("HakiosGPU: [SMMU %s] buffers: %u made in %llu us each, %u kept ones given again (%llu MB kept)\n",
++		    hakios_gpu_smmu() ? "on" : "off", gGPUStat.made,
+ 		    gGPUStat.made ? making / NSEC_PER_USEC / gGPUStat.made : 0, gGPUStat.given_again, fKeptBytes >> 20);
+ 		IOLog("HakiosGPU: %u submissions in %llu ms: %u command buffers and %u buffers named, %llu KB out of the cache "
+ 		    "in %llu us a submission; the GPU worked %llu us on each of %u (%u under 0.1 ms, %u under 0.25, %u under 0.5, "
