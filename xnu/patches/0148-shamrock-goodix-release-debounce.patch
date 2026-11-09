@@ -1,0 +1,76 @@
+diff --git c/bsd/dev/sweet_touch.c i/bsd/dev/sweet_touch.c
+index 35ee74d..6d9a4ee 100644
+--- c/bsd/dev/sweet_touch.c
++++ i/bsd/dev/sweet_touch.c
+@@ -117,6 +117,8 @@ static struct {
+ 	uint32_t boot_cfg91, boot_io91, boot_cfg64, boot_io64;     /* as lk2nd left them */
+ 	uint8_t gt_addr;                /* the Goodix's address (0x14 or 0x5d); 0: the Himax at 0x48 */
+ 	uint8_t gt_status;              /* the last 0x814e status byte read */
++	uint32_t gt_tick;               /* gt_poll() calls */
++	uint32_t gt_seen[HX_MAX_FINGERS];       /* gt_tick when each contact was last reported */
+ 	uint32_t gt_ready;              /* reads with the buffer-ready bit set */
+ } g_touch;
+ 
+@@ -464,18 +466,39 @@ gt_config(void)
+ 	(void)gt_write_u8(GT_REG_COOR, 0);
+ }
+ 
++/*
++ * r51full: a drag came through as a run of short taps (down, up 50 ms later, down again a few
++ * pixels on): the GT9xx reports some frames with no contact while the finger stays down. A
++ * contact is let go only after GT_RELEASE_POLLS polls (~60 ms) without it.
++ */
++#define GT_RELEASE_POLLS    8
++
++static void
++gt_release_stale(uint32_t *events)
++{
++	for (unsigned i = 0; i < HX_MAX_FINGERS; i++) {
++		if ((g_touch.down_mask & (1u << i)) && g_touch.gt_tick - g_touch.gt_seen[i] >= GT_RELEASE_POLLS) {
++			sweet_hid_touch((int)i, 0, g_touch.last_x[i], g_touch.last_y[i]);
++			g_touch.down_mask &= ~(1u << i);
++			(*events)++;
++		}
++	}
++}
++
+ static int
+ gt_poll(uint32_t *events)
+ {
+ 	uint8_t buf[1 + GT_CONTACTS * 8];
+-	uint32_t pressed = 0;
+-	int err = gt_read(GT_REG_COOR, buf, 1);
++	int err;
+ 
++	g_touch.gt_tick++;
++	err = gt_read(GT_REG_COOR, buf, 1);
+ 	if (err) {
+ 		return err;
+ 	}
+ 	g_touch.gt_status = buf[0];
+ 	if (!(buf[0] & 0x80)) {
++		gt_release_stale(events);
+ 		return 0;                       /* nothing new */
+ 	}
+ 	g_touch.gt_ready++;
+@@ -498,17 +521,12 @@ gt_poll(uint32_t *events)
+ 		int py = (int)(y * 1920u / g_touch.yres);
+ 		g_touch.last_x[id] = (uint16_t)px;
+ 		g_touch.last_y[id] = (uint16_t)py;
++		g_touch.gt_seen[id] = g_touch.gt_tick;
++		g_touch.down_mask |= 1u << id;
+ 		sweet_hid_touch((int)id, 1, px, py);
+-		pressed |= 1u << id;
+ 		(*events)++;
+ 	}
+-	for (unsigned i = 0; i < HX_MAX_FINGERS; i++) {
+-		if ((g_touch.down_mask & (1u << i)) && !(pressed & (1u << i))) {
+-			sweet_hid_touch((int)i, 0, g_touch.last_x[i], g_touch.last_y[i]);
+-			(*events)++;
+-		}
+-	}
+-	g_touch.down_mask = pressed;
++	gt_release_stale(events);
+ 	return gt_write_u8(GT_REG_COOR, 0);
+ }
+ 
