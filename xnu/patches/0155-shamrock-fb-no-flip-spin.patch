@@ -1,0 +1,92 @@
+diff --git c/iokit/Kernel/arm/SweetFramebuffer.cpp i/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 8b70b4e..2a0a5b9 100644
+--- c/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ i/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -152,7 +152,9 @@ public:
+ 	volatile uint32_t *fVIG0;
+ 	bool          fVigSetUp, fVigOn;
+ 	SweetSurface *fScanned[2];      /* [0] shown by VIG0 now, [1] flushed to be shown next */
+-	uint32_t      fVigFrames, fCpuFrames;
++	uint32_t      fVigFrames, fCpuFrames, fFlipBusy;
++	uint32_t      fNotVig[5];       /* why not VIG0: layers, surface kind/size/format, memory not contiguous, other */
++	uint32_t      fNotVigLayers, fNotVigW, fNotVigH, fNotVigFmt;  /* the last one seen */
+ 	bool presentMDP(const uint8_t *rec);
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -353,6 +355,16 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
++	/*
++	 * shamrock: r57 measured ~50-60 GL frames a second but the screen kept stuttering: present()
++	 * spun up to 20 ms for the last MDP flip to take (the panel's vsync, not this timer's), on the
++	 * work loop that also sends the vsync notifications. A flip still pending: this tick is skipped
++	 * (the frame stays dirty for the next one), nothing waits.
++	 */
++	if (flush && fb->fMDP != NULL && (fb->fMDP[SWEET_MDP_CTL0_FLUSH / 4] & SWEET_FLUSH_ALL) != 0) {
++		flush = false;
++		fb->fFlipBusy++;
++	}
+ 	uint8_t *rec = NULL;
+ 	if (flush) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+@@ -440,12 +452,25 @@ AppleCLCD::presentMDP(const uint8_t *rec)
+ 			id = get32(rec, 0x54 + 4 * layer);
+ 		}
+ 	}
++	fNotVigLayers = layers;
+ 	if (layers != 1) {
++		fNotVig[0]++;
+ 		return false;
+ 	}
+ 	SweetSurface *s = sweet_surface_copy(id);
+-	if (s == NULL || s == fSurface || s->memory == NULL || s->pixelFormat != SWEET_FB_FORMAT_BGRA ||
+-	    s->bytesPerElement != 4 || s->width != fLogicalW || s->height != fLogicalH || (s->bytesPerRow & 15) != 0) {
++	if (s != NULL) {
++		fNotVigW = s->width;
++		fNotVigH = s->height;
++		fNotVigFmt = s->pixelFormat;
++	}
++	if (s == NULL || s == fSurface || s->memory == NULL) {
++		fNotVig[1]++;
++		OSSafeReleaseNULL(s);
++		return false;
++	}
++	if (s->pixelFormat != SWEET_FB_FORMAT_BGRA || s->bytesPerElement != 4 || s->width != fLogicalW ||
++	    s->height != fLogicalH || (s->bytesPerRow & 15) != 0) {
++		fNotVig[2]++;
+ 		OSSafeReleaseNULL(s);
+ 		return false;
+ 	}
+@@ -453,6 +478,7 @@ AppleCLCD::presentMDP(const uint8_t *rec)
+ 	addr64_t phys = s->memory->getPhysicalSegment(s->offset, &len, kIOMemoryMapperNone);
+ 	if (phys == 0 || phys + (uint64_t)s->bytesPerRow * s->height > 0x100000000ULL ||
+ 	    len < (IOByteCount)s->bytesPerRow * s->height) {
++		fNotVig[3]++;
+ 		OSSafeReleaseNULL(s);
+ 		return false;
+ 	}
+@@ -508,8 +534,11 @@ AppleCLCD::presentMDP(const uint8_t *rec)
+ 	__builtin_arm_dsb(0xf);
+ 	OSSafeReleaseNULL(fScanned[1]);
+ 	fScanned[1] = s;                                /* (held: VIG0 reads it from the next vsync on) */
+-	if ((++fVigFrames % 600) == 1) {
+-		IOLog("SWEET FB: %u frames by VIG0, %u by the processor\n", fVigFrames, fCpuFrames);
++	if ((++fVigFrames % 300) == 1) {
++		IOLog("SWEET FB: %u frames by VIG0, %u by the processor, %u ticks skipped (flip pending); not VIG0: "
++		    "%u layers!=1, %u no surface, %u size/format, %u not contiguous; last refused: %u layers, %ux%u fmt %#x\n",
++		    fVigFrames, fCpuFrames, fFlipBusy, fNotVig[0], fNotVig[1], fNotVig[2], fNotVig[3], fNotVigLayers, fNotVigW,
++		    fNotVigH, fNotVigFmt);
+ 	}
+ 	return true;
+ }
+@@ -524,7 +553,8 @@ AppleCLCD::present(const uint8_t *rec)
+ 
+ 	if (fMDP != NULL) {
+ 		/* the last flip must have happened (its flush bit clears at the vsync that takes it) */
+-		for (int i = 0; i < 400 && (fMDP[SWEET_MDP_CTL0_FLUSH / 4] & SWEET_FLUSH_ALL); i++) {
++		/* (vsyncFired() presents only once the last flip has taken; a short wait at most for the CPU path) */
++		for (int i = 0; i < 40 && (fMDP[SWEET_MDP_CTL0_FLUSH / 4] & SWEET_FLUSH_ALL); i++) {
+ 			IODelay(50);
+ 		}
+ 		/* what VIG0 was given last is shown now: the one before can go */
