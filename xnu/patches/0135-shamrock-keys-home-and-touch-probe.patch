@@ -1,0 +1,277 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index d14f2f9..65caf83 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -109,6 +109,7 @@ bsd/dev/sweet_emmc.c		standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
++bsd/dev/shamrock_keys.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/shamrock_keys.c b/bsd/dev/shamrock_keys.c
+new file mode 100644
+index 0000000..451801c
+--- /dev/null
++++ b/bsd/dev/shamrock_keys.c
+@@ -0,0 +1,192 @@
++/*
++ * SHAMROCK (MSM8952 + PM8950) keys, polled. READ ONLY.
++ *
++ * Power and volume-down are the PM8950 PON block (PPID 0x008, PON_RT_STS
++ * 0x810: bit 0 KPDPWR, bit 1 RESIN), read through the SPMI arbiter v2
++ * observer channel (spmi@200f000: core 0x200f000, obsrvr 0x2c00000, cnfg
++ * 0x200a000; Linux spmi-pmic-arb v2 layout: APID table at core+0x800,
++ * channel at obsrvr + 0x8000 * apid). Volume-up is TLMM gpio85, active low.
++ *
++ * There is no home button on this phone, so volume-down is sent as Home
++ * (consumer Menu): iOS on a home-button model unlocks with it. sweetkeys=0
++ * disables the driver, sweetkeys_home=0 keeps volume-down as volume-down.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_hid_key(int key, int down);
++void shamrock_keys_init(void);
++
++#define SK_CORE_PA      0x0200f000u
++#define SK_OBS_PA       0x02c00000u
++#define SK_CNFG_PA      0x0200a000u
++#define SK_TLMM_GPIO85  (0x01000000u + 85u * 0x1000u)
++#define SK_PON_RT       0x0810u
++#define SK_NO_APID      0xffffu
++#define SK_MAX_APID     256u    /* core 0x800..0xbff: inside the 4 KB core window; obsrvr 0x8000 * 256 = its 8 MB */
++
++static vm_offset_t sk_core, sk_cnfg, sk_obs, sk_tlmm;
++static uint16_t sk_pon_apid = SK_NO_APID;
++static uint32_t sk_last_status;
++static bool sk_started;
++static int sk_chan;
++
++static uint32_t
++sk_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static uint16_t
++sk_find_apid(uint16_t ppid)
++{
++	uint16_t found = SK_NO_APID;
++
++	for (uint32_t i = 0; i < SK_MAX_APID; i++) {
++		uint32_t map = sk_rd(sk_core, 0x800u + 4u * i);
++
++		if (map == 0 || ((map >> 8) & 0xfffu) != ppid) {
++			continue;
++		}
++		uint32_t owner = sk_rd(sk_cnfg, 0x700u + 4u * i) & 7u;
++		if (found == SK_NO_APID || owner == 0) {
++			found = (uint16_t)i;
++		}
++	}
++	return found;
++}
++
++/* One byte, EXT_READL on the observer channel (the only write: the command register). */
++static bool
++sk_read(uint16_t addr, uint8_t *out)
++{
++	uint32_t cmd = (1u << 27) | ((uint32_t)(addr & 0xffu) << 4);
++
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(sk_obs + 0x00u) = cmd;
++	__asm__ volatile ("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; i++) {
++		sk_last_status = sk_rd(sk_obs, 0x08u);
++		if (sk_last_status & 1u) {
++			if (sk_last_status & 0x0eu) {
++				return false;
++			}
++			*out = (uint8_t)sk_rd(sk_obs, 0x18u);
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++sk_wait(void)
++{
++	uint64_t deadline;
++
++	clock_interval_to_deadline(20, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&sk_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++sk_thread(void *arg, wait_result_t result)
++{
++	/* sweet_hid_key: 0 power, 1 volume up, 2 volume down, 3 home */
++	int home = 1;
++	int map[3];
++	int state[3] = {0, 0, 0};
++	unsigned errors = 0;
++
++	(void)arg;
++	(void)result;
++	PE_parse_boot_argn("sweetkeys_home", &home, sizeof(home));
++	map[0] = 0;
++	map[1] = 1;
++	map[2] = home ? 3 : 2;
++	for (;;) {
++		uint8_t pon = 0;
++		bool pok = sk_read(SK_PON_RT, &pon);
++		int now[3];
++
++		now[0] = !!(pon & 1u);
++		now[1] = sk_tlmm ? !(sk_rd(sk_tlmm, 4u) & 1u) : 0;
++		now[2] = !!(pon & 2u);
++		if (!pok) {
++			if ((errors++ % 250u) == 0) {
++				printf("SHAMROCK KEYS: PON read error status=%#x\n", sk_last_status);
++			}
++		} else {
++			errors = 0;
++		}
++		for (int k = 0; k < 3; k++) {
++			if ((k == 1 || pok) && now[k] != state[k]) {
++				state[k] = now[k];
++				printf("SHAMROCK KEYS: key %d (%s) %s\n", k,
++				    k == 0 ? "power" : k == 1 ? "volume up" : (home ? "volume down = home" : "volume down"),
++				    state[k] ? "down" : "up");
++				sweet_hid_key(map[k], state[k]);
++			}
++		}
++		sk_wait();
++	}
++}
++
++void
++shamrock_keys_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++	uint8_t pon = 0;
++
++	if (sk_started) {
++		return;
++	}
++	sk_started = true;
++	PE_parse_boot_argn("sweetkeys", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("SHAMROCK KEYS: disabled (sweetkeys=0)\n");
++		return;
++	}
++	sk_core = ml_io_map(SK_CORE_PA, 0x1000);
++	sk_cnfg = ml_io_map(SK_CNFG_PA, 0x1000);
++	sk_tlmm = ml_io_map(SK_TLMM_GPIO85, 0x1000);
++	if (!sk_core || !sk_cnfg) {
++		printf("SHAMROCK KEYS: MMIO mapping failed\n");
++		return;
++	}
++	uint32_t version = sk_rd(sk_core, 0);
++	if (version < 0x20000000u || version >= 0x30000000u) {
++		printf("SHAMROCK KEYS: unexpected SPMI arbiter version %#x, not v2: keys off\n", version);
++		return;
++	}
++	sk_pon_apid = sk_find_apid(0x008);
++	if (sk_pon_apid == SK_NO_APID) {
++		printf("SHAMROCK KEYS: arbiter %#x: no APID for PON (PPID 0x008): keys off\n", version);
++		return;
++	}
++	sk_obs = ml_io_map(SK_OBS_PA + 0x8000u * sk_pon_apid, 0x1000);
++	if (!sk_obs) {
++		printf("SHAMROCK KEYS: observer mapping failed\n");
++		return;
++	}
++	bool pok = sk_read(SK_PON_RT, &pon);
++	printf("SHAMROCK KEYS: arbiter %#x, PON apid %u, PON_RT %#x/%d status %#x, gpio85 %#x\n",
++	    version, sk_pon_apid, pon, pok, sk_last_status, sk_tlmm ? sk_rd(sk_tlmm, 4u) : 0xffffffffu);
++	kern_return_t kr = kernel_thread_start(sk_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SHAMROCK KEYS: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+index bd26f2d..c59266f 100644
+--- a/bsd/dev/sweet_emmc.c
++++ b/bsd/dev/sweet_emmc.c
+@@ -749,7 +749,9 @@ sweet_emmc_init(void)
+ 	printf("SWEET EMMC: \"%s\": first sector 0x%llx, %llu MiB, %s\n", want, se.first_block,
+ 	    se.nblocks * 512 >> 20, se.dma_ok ? "ADMA2 read" : "PIO");
+ 	extern void sweet_touch_init(void);
++	extern void shamrock_keys_init(void);
+ 	sweet_touch_init();
++	shamrock_keys_init();
+ 	return 0;
+ }
+ 
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 4f65135..6156a4d 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -285,7 +285,21 @@ shamrock_touch_thread(void *arg, wait_result_t result)
+ 		printf("SHAMROCK TOUCH: probe 0x8140 returned %d\n", err);
+ 	}
+ 
+-	uint32_t poll_count = 0;
++	/*
++	 * shamrock: which controller answers? The DT lists Synaptics (0x20), Himax (0x48) and Goodix
++	 * (0x5d, or 0x14 after a reset with INT high). A one-byte read gets an ACK or a NACK (EIO).
++	 */
++	static const uint8_t probe_addr[] = { 0x5d, 0x14, 0x20, 0x48 };
++	int probe_err[4];
++	for (int i = 0; i < 4; i++) {
++		uint8_t one = 0;
++		probe_err[i] = qup_i2c_read(probe_addr[i], &one, 1);
++	}
++	printf("SHAMROCK TOUCH: probe 0x5d=%d 0x14=%d 0x20=%d 0x48=%d (0 = answered)\n",
++	    probe_err[0], probe_err[1], probe_err[2], probe_err[3]);
++
++	uint32_t poll_count = 0, reads_ok = 0, reads_bad = 0, ready = 0;
++	int last_err = 0;
+ 	int test_touch = 0;
+ 	PE_parse_boot_argn("sweettouch_test", &test_touch, sizeof(test_touch));
+ 
+@@ -309,9 +323,25 @@ shamrock_touch_thread(void *arg, wait_result_t result)
+ 		/* Read Goodix Touch Coordinates from 0x814E */
+ 		uint8_t report[1 + 8]; /* 1 status byte + contact 0 */
+ 		err = goodix_read_reg(GOODIX_READ_COOR, report, sizeof(report));
++		if (err == 0) {
++			reads_ok++;
++		} else {
++			reads_bad++;
++			last_err = err;
++		}
++		if ((poll_count % 1000) == 0) {
++			/* (a status line every ~10 s, so a stall dump taken late still shows it) */
++			printf("SHAMROCK TOUCH: status detected=%d probe 0x5d=%d 0x14=%d 0x20=%d 0x48=%d reads ok=%u bad=%u last=%d ready=%u "
++			    "qup state=%#x err=%#x i2c=%#x gpio64 cfg=%#x io=%#x gpio65 cfg=%#x io=%#x\n",
++			    g_touch.detected, probe_err[0], probe_err[1], probe_err[2], probe_err[3], reads_ok, reads_bad, last_err, ready,
++			    touch_rd(g_touch.qup, QUP_STATE), touch_rd(g_touch.qup, QUP_ERROR_FLAGS), touch_rd(g_touch.qup, QUP_I2C_STATUS),
++			    touch_rd(g_touch.tlmm, TLMM_GPIO_CFG(64)), touch_rd(g_touch.tlmm, TLMM_GPIO_IN_OUT(64)),
++			    touch_rd(g_touch.tlmm, TLMM_GPIO_CFG(65)), touch_rd(g_touch.tlmm, TLMM_GPIO_IN_OUT(65)));
++		}
+ 		if (err == 0) {
+ 			uint8_t status = report[0];
+ 			if (status & 0x80u) { /* Buffer ready */
++				ready++;
+ 				int count = status & 0x0fu;
+ 				if (count > 0) {
+ 					uint8_t *c = &report[1];
