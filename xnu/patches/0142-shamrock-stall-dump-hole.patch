@@ -1,0 +1,32 @@
+diff --git c/osfmk/arm64/shamrock_phys.h i/osfmk/arm64/shamrock_phys.h
+index 1d35393..f47e71f 100644
+--- c/osfmk/arm64/shamrock_phys.h
++++ i/osfmk/arm64/shamrock_phys.h
+@@ -10,7 +10,11 @@
+  * keeps its vm_pages off the free lists, and the physmap leaves it unmapped so the CPU never
+  * speculates into TrustZone-protected memory. As ios-river's 0205 for the Moto G7.
+  *
+- * With the old ADT (RAM from 0x91000000) the hole lies below RAM and changes nothing.
++ * 0xbff00000-0xc0000000 is ours: sweet_stall.c copies the log there (ml_io_map) before the watchdog
++ * reset, and lk2nd reads it back. Once RAM went past 0xbfe00000 (r44m) those pages were managed:
++ * r47small panicked in pmap_enter_pv mapping them as I/O while they were in use.
++ *
++ * With the old ADT (RAM from 0x91000000 to 0xbfe00000) both holes lie outside RAM.
+  */
+ #ifndef _ARM64_SHAMROCK_PHYS_H_
+ #define _ARM64_SHAMROCK_PHYS_H_
+@@ -19,12 +23,13 @@
+ #include <stdint.h>
+ #include <stdbool.h>
+ 
+-#define SHAMROCK_PHYS_HOLES 1
++#define SHAMROCK_PHYS_HOLES 2
+ 
+ static const struct {
+ 	uint64_t start, end;
+ } shamrock_phys_holes[SHAMROCK_PHYS_HOLES] = {
+ 	{ 0x80000000ULL, 0x91000000ULL },
++	{ 0xbff00000ULL, 0xc0000000ULL },       /* the stall dump (0xbff40000) and s1's clock notes (0xbff3f000), read by lk2nd after a reset */
+ };
+ 
+ static inline bool
