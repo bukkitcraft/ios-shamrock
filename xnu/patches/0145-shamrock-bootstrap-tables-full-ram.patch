@@ -1,0 +1,66 @@
+diff --git c/osfmk/arm/pmap/pmap.h i/osfmk/arm/pmap/pmap.h
+index 75f3db0..783f0c8 100644
+--- c/osfmk/arm/pmap/pmap.h
++++ i/osfmk/arm/pmap/pmap.h
+@@ -111,6 +111,13 @@
+  * Upper limit on how many pages can be consumed by bootstrap page tables
+  */
+ #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 34)
++#elif defined(SWEET)
++/*
++ * shamrock: 4K pages without ARM_LARGE_MEMORY, RAM from 0x20000000 (full-RAM ADT): the V=P and
++ * KVA maps of ~2.8 GB need 2 L1 + 2 * 4 L2 pages, more than 8 (start.s overran the array and
++ * wrote over the kernel's data). Room for the early framebuffer's L2 too.
++ */
++#define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 16)
+ #else /* defined(ARM_LARGE_MEMORY) */
+ #define BOOTSTRAP_TABLE_SIZE (ARM_PGBYTES * 8)
+ #endif /* defined(ARM_LARGE_MEMORY) */
+diff --git c/osfmk/arm64/start.s i/osfmk/arm64/start.s
+index 280693e..a6dd699 100644
+--- c/osfmk/arm64/start.s
++++ i/osfmk/arm64/start.s
+@@ -642,6 +642,21 @@ Lkernelcache_base_found:
+ 	add		x22, x22, x18
+ 	add		x23, x23, x18
+ 
++#if defined(SWEET)
++	/*
++	 * shamrock: with RAM from 0x20000000 the bootstrap maps would cover 0x80000000-0x91000000
++	 * (TZ, modem, LPASS: never to be mapped, the CPU may prefetch it). They only need the kernel
++	 * and what arm_vm_init takes right after it: stop them at 0x80000000.
++	 */
++	MOV64	x10, 0x80000000
++	cmp		x23, x10
++	b.hs	4f
++	sub		x11, x10, x23
++	cmp		x24, x11
++	csel	x24, x11, x24, hi
++4:
++#endif
++
+ 	/*
+ 	 * x0  - V=P virtual cursor
+ 	 * x4  - V=P physical cursor
+@@ -691,7 +706,21 @@ Lkernelcache_base_found:
+ 	orr		x11, x11, x10
+ 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
+ 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
++	/*
++	 * shamrock: that holds only while RAM starts in the framebuffer's 1 GB (old ADT, RAM from
++	 * 0x91000000). With RAM from 0x20000000 the framebuffer needs an L2 table of its own, or its
++	 * blocks land in RAM's table (mapping VA 0x10000000) and 0x90000000 stays unmapped/cached.
++	 */
++	lsr		x13, x10, #(ARM_TT_L1_SHIFT)
++	lsr		x16, x23, #(ARM_TT_L1_SHIFT)
++	cmp		x13, x16
++	b.ne	5f
+ 	add		x13, x25, #(2 * PGBYTES)
++	b		6f
++5:	add		x2, x2, PGBYTES						// a fresh (zeroed) bootstrap page
++	create_l1_table_entry	x10, x25, x2, x6, x7, x8
++	mov		x13, x2
++6:
+ 	mov		x16, #(SWEET_EARLY_FB_BLOCKS)
+ 	mov		x17, #(1 << ARM_TT_L2_SHIFT)
+ 1:	str		x11, [x13, x12, lsl #TTE_SHIFT]
