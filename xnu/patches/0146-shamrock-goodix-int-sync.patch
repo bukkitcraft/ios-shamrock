@@ -1,0 +1,53 @@
+diff --git c/bsd/dev/sweet_touch.c i/bsd/dev/sweet_touch.c
+index 9a68119..35ee74d 100644
+--- c/bsd/dev/sweet_touch.c
++++ i/bsd/dev/sweet_touch.c
+@@ -116,6 +116,8 @@ static struct {
+ 	uint16_t last_x[HX_MAX_FINGERS], last_y[HX_MAX_FINGERS];
+ 	uint32_t boot_cfg91, boot_io91, boot_cfg64, boot_io64;     /* as lk2nd left them */
+ 	uint8_t gt_addr;                /* the Goodix's address (0x14 or 0x5d); 0: the Himax at 0x48 */
++	uint8_t gt_status;              /* the last 0x814e status byte read */
++	uint32_t gt_ready;              /* reads with the buffer-ready bit set */
+ } g_touch;
+ 
+ static inline uint32_t
+@@ -472,9 +474,11 @@ gt_poll(uint32_t *events)
+ 	if (err) {
+ 		return err;
+ 	}
++	g_touch.gt_status = buf[0];
+ 	if (!(buf[0] & 0x80)) {
+ 		return 0;                       /* nothing new */
+ 	}
++	g_touch.gt_ready++;
+ 	unsigned n = buf[0] & 0x0f;
+ 	if (n > GT_CONTACTS) {
+ 		n = GT_CONTACTS;
+@@ -547,6 +551,15 @@ shamrock_touch_thread(void *arg, wait_result_t result)
+ 	}
+ 	err = 0;
+ 	if (g_touch.gt_addr) {
++		/*
++		 * r49old: the GT9xx answered and read fine but never reported a contact. Linux goodix.c
++		 * ends its reset with goodix_int_sync(): INT driven low 50 ms, then released to the chip
++		 * (an input). Without it the firmware does not enter its working mode.
++		 */
++		gpio_out(GPIO_TS_IRQ, 0);
++		touch_sleep_ms(50);
++		touch_wr(g_touch.tlmm, TLMM_CFG(GPIO_TS_IRQ), TLMM_PULL_UP);
++		touch_sleep_ms(50);
+ 		gt_config();
+ 	} else {
+ 		hx_config();
+@@ -565,8 +578,9 @@ shamrock_touch_thread(void *arg, wait_result_t result)
+ 			}
+ 		}
+ 		if ((polls % (err ? 10u : 1200u)) == 0) {
+-			printf("SHAMROCK TOUCH: status hx=%d polls ok=%u bad=%u last=%d events=%u i2c %#x err %#x irq-gpio %#x\n",
+-			    err, ok, bad, last, events, g_touch.last_i2c, g_touch.last_err,
++			printf("SHAMROCK TOUCH: status %s %#x polls ok=%u bad=%u last=%d events=%u (goodix status %#x, ready %u) i2c %#x err %#x irq-gpio %#x\n",
++			    g_touch.gt_addr ? "goodix" : "himax", g_touch.gt_addr ? g_touch.gt_addr : 0x48, ok, bad, last, events,
++			    g_touch.gt_status, g_touch.gt_ready, g_touch.last_i2c, g_touch.last_err,
+ 			    touch_rd(g_touch.tlmm, TLMM_IO(GPIO_TS_IRQ)));
+ 		}
+ 	}
