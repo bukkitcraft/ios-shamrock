@@ -1,0 +1,77 @@
+diff --git c/iokit/Kernel/arm/SweetSurface.cpp i/iokit/Kernel/arm/SweetSurface.cpp
+index 8332444..67ab684 100644
+--- c/iokit/Kernel/arm/SweetSurface.cpp
++++ i/iokit/Kernel/arm/SweetSurface.cpp
+@@ -275,6 +275,9 @@ SweetSurface::free()
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
+ 	OSSafeReleaseNULL(kernelMap);
++	if (clientWrapped && memory != NULL) {
++		memory->complete();
++	}
+ 	OSSafeReleaseNULL(memory);
+ 	if (poolSize != 0) {
+ 		sweet_pool_free(poolOffset);
+@@ -292,7 +295,13 @@ SweetSurface::kernelAddress()
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
+-		kernelMap = memory->map(kIOMapWriteCombineCache);
++		/*
++		 * shamrock: cached, as the clients' views are (mapCache), unless the surface is the panel
++		 * memory (write-combined). The framebuffer's present() reads every frame through this:
++		 * through a write-combined view that was ~11 MB of uncached reads a frame on the A53.
++		 * Whoever reads after the GPU wrote still drops the lines first (present(), HakiosGPU).
++		 */
++		kernelMap = memory->map(mapCache == kIOMapWriteCombineCache ? kIOMapWriteCombineCache : kIOMapDefaultCache);
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
+@@ -905,8 +914,34 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 	if (ret == kIOReturnSuccess) {
+ 		IOMemoryDescriptor *mem = NULL;
+ 		uint64_t poff = 0, psize = 0;
++		/*
++		 * shamrock: a surface around memory the client has already (IOSurfaceAddress): CoreAnimation
++		 * makes them around pictures it holds (icons, a layer's contents) and does not copy the pixels
++		 * again; given fresh zeroed memory instead, every icon was blank. The surface's pixels are that
++		 * memory itself, held (wired) for the surface's life, as HackiOS's MiniIOSurface does.
++		 */
++		OSNumber *wrapAddr = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
++		if (wrapAddr != NULL && props->getObject("IOSurfaceAddressRanges") == NULL) {
++			IOReturn held = kIOReturnNoMemory;
++			for (unsigned attempt = 0; attempt < 2 && held != kIOReturnSuccess; attempt++) {
++				OSSafeReleaseNULL(mem);
++				mem = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)wrapAddr->unsigned64BitValue(), s->allocSize,
++				    attempt == 0 ? kIODirectionInOut : kIODirectionOut, current_task());
++				held = mem != NULL ? mem->prepare() : kIOReturnNoMemory;
++			}
++			if (held != kIOReturnSuccess) {
++				OSSafeReleaseNULL(mem);
++				static uint32_t unheld;
++				if (unheld++ < 8) {
++					IOLog("SWEET SURF: the memory to make a surface around (%u bytes at %#llx) cannot be held (%#x)\n",
++					    s->allocSize, wrapAddr->unsigned64BitValue(), held);
++				}
++			} else {
++				s->clientWrapped = true;
++			}
++		}
+ 		/* shamrock: large surfaces from the contiguous pool (GPU render targets), see sweet_pool_init() */
+-		if (sweet_pool != NULL && s->allocSize >= SWEET_POOL_MIN && sweet_pool_alloc(s->allocSize, &poff, &psize)) {
++		if (mem == NULL && sweet_pool != NULL && s->allocSize >= SWEET_POOL_MIN && sweet_pool_alloc(s->allocSize, &poff, &psize)) {
+ 			mem = IOSubMemoryDescriptor::withSubRange(sweet_pool, poff, psize, kIODirectionInOut);
+ 			if (mem == NULL) {
+ 				sweet_pool_free(poff);
+diff --git c/iokit/Kernel/arm/SweetSurface.h i/iokit/Kernel/arm/SweetSurface.h
+index b8a1e22..5c25473 100644
+--- c/iokit/Kernel/arm/SweetSurface.h
++++ i/iokit/Kernel/arm/SweetSurface.h
+@@ -35,6 +35,7 @@ public:
+ 	uint32_t cacheMode, planeCount, parentID;
+ 	uint32_t drawn;                         /* shamrock: fence of the last GPU submission that drew into it (HakiosGPU.cpp) */
+ 	uint64_t poolOffset, poolSize;          /* shamrock: pixels in the contiguous surface pool (poolSize 0: not) */
++	bool     clientWrapped;                 /* shamrock: memory is the client's own (IOSurfaceAddress), held until free */
+ 	struct sweet_surface_plane planes[SWEET_SURFACE_MAX_PLANES];
+ 
+ 	IOMemoryDescriptor       *memory;       /* pixels (buffer or physical) */
