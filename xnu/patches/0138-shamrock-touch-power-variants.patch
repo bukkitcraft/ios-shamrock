@@ -1,0 +1,141 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 1443564..2c26d3c 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -114,6 +114,7 @@ static struct {
+ 	unsigned xres, yres;
+ 	uint32_t down_mask;
+ 	uint16_t last_x[HX_MAX_FINGERS], last_y[HX_MAX_FINGERS];
++	uint32_t boot_cfg91, boot_io91, boot_cfg64, boot_io64;     /* as lk2nd left them */
+ } g_touch;
+ 
+ static inline uint32_t
+@@ -274,32 +275,64 @@ gpio_out(int n, int level)
+ 	touch_wr(g_touch.tlmm, TLMM_CFG(n), TLMM_OE);
+ }
+ 
++/*
++ * Power and reset the controller one way (variant), then see who answers. r45: 0x48 NACKed
++ * after "LDO on, reset low 20 ms, high, 100 ms" with SDA/SCL idle high, so try a few orders.
++ *   0: LDO off 200 ms, on 50 ms, reset low 20 ms, high, wait 300 ms   (active-low reset)
++ *   1: as 0, but reset left low                                       (active-high reset)
++ *   2: reset low first, LDO off 200 ms, on 100 ms, reset high, wait 500 ms
++ *   3: LDO on, reset high 50 ms, low 50 ms, high, wait 500 ms
++ */
+ static int
+-hx_probe(void)
++hx_power_variant(int v, int answers[4])
+ {
++	static const uint8_t addrs[4] = { 0x48, 0x5d, 0x14, 0x20 };
+ 	uint8_t one;
+-	int err;
+ 
+-	/* power on (LDO via gpio91), reset low 20 ms, release, give the firmware time */
+-	gpio_out(GPIO_TS_POWER, 1);
+-	touch_sleep_ms(20);
+-	gpio_out(GPIO_TS_RESET, 0);
+-	touch_sleep_ms(20);
+-	gpio_out(GPIO_TS_RESET, 1);
+-	touch_sleep_ms(100);
+-	err = qup_xfer(HX_ADDR, true, &one, 1);
+-	if (err == ENXIO) {
+-		/* (pmOS described reset as active high: try leaving it low) */
++	switch (v) {
++	case 0:
++	case 1:
++		gpio_out(GPIO_TS_POWER, 0);
++		touch_sleep_ms(200);
++		gpio_out(GPIO_TS_POWER, 1);
++		touch_sleep_ms(50);
+ 		gpio_out(GPIO_TS_RESET, 0);
++		touch_sleep_ms(20);
++		gpio_out(GPIO_TS_RESET, v == 0);
++		touch_sleep_ms(300);
++		break;
++	case 2:
++		gpio_out(GPIO_TS_RESET, 0);
++		gpio_out(GPIO_TS_POWER, 0);
++		touch_sleep_ms(200);
++		gpio_out(GPIO_TS_POWER, 1);
+ 		touch_sleep_ms(100);
+-		int err2 = qup_xfer(HX_ADDR, true, &one, 1);
+-		printf("SHAMROCK TOUCH: 0x48 NACK with reset high; with reset low -> %d\n", err2);
+-		if (err2 != 0) {
+-			gpio_out(GPIO_TS_RESET, 1);
+-		}
+-		err = err2;
++		gpio_out(GPIO_TS_RESET, 1);
++		touch_sleep_ms(500);
++		break;
++	default:
++		gpio_out(GPIO_TS_POWER, 1);
++		gpio_out(GPIO_TS_RESET, 1);
++		touch_sleep_ms(50);
++		gpio_out(GPIO_TS_RESET, 0);
++		touch_sleep_ms(50);
++		gpio_out(GPIO_TS_RESET, 1);
++		touch_sleep_ms(500);
++		break;
+ 	}
+-	return err;
++	for (int i = 0; i < 4; i++) {
++		answers[i] = qup_xfer(addrs[i], true, &one, 1);
++	}
++	printf("SHAMROCK TOUCH: try %d: 0x48=%d 0x5d=%d 0x14=%d 0x20=%d (0 = answered, 6 = NACK) i2c %#x err %#x; "
++	    "gpio91 %#x/%#x gpio64 %#x/%#x gpio65 %#x/%#x (lk2nd left 91 %#x/%#x 64 %#x/%#x) cbcr %#x pins %#x/%#x\n",
++	    v, answers[0], answers[1], answers[2], answers[3], g_touch.last_i2c, g_touch.last_err,
++	    touch_rd(g_touch.tlmm, TLMM_CFG(GPIO_TS_POWER)), touch_rd(g_touch.tlmm, TLMM_IO(GPIO_TS_POWER)),
++	    touch_rd(g_touch.tlmm, TLMM_CFG(GPIO_TS_RESET)), touch_rd(g_touch.tlmm, TLMM_IO(GPIO_TS_RESET)),
++	    touch_rd(g_touch.tlmm, TLMM_CFG(GPIO_TS_IRQ)), touch_rd(g_touch.tlmm, TLMM_IO(GPIO_TS_IRQ)),
++	    g_touch.boot_cfg91, g_touch.boot_io91, g_touch.boot_cfg64, g_touch.boot_io64,
++	    touch_rd(g_touch.gcc, GCC_QUP3_I2C_CBCR),
++	    touch_rd(g_touch.tlmm, TLMM_CFG(GPIO_I2C_SDA)), touch_rd(g_touch.tlmm, TLMM_CFG(GPIO_I2C_SCL)));
++	return answers[0];
+ }
+ 
+ static void
+@@ -405,22 +438,19 @@ shamrock_touch_thread(void *arg, wait_result_t result)
+ 	printf("SHAMROCK TOUCH: QUP io_mode %#x: out fifo %u, in fifo %u bytes; clk_ctl %#x\n",
+ 	    iomode, g_touch.out_fifo, g_touch.in_fifo, QUP_CLK_CTL_400K);
+ 
+-	err = hx_probe();
+-	printf("SHAMROCK TOUCH: HX852x at 0x48 -> %d (0 = answered) i2c %#x err %#x; gpio91 %#x/%#x gpio64 %#x/%#x gpio65 %#x/%#x\n",
+-	    err, g_touch.last_i2c, g_touch.last_err,
+-	    touch_rd(g_touch.tlmm, TLMM_CFG(GPIO_TS_POWER)), touch_rd(g_touch.tlmm, TLMM_IO(GPIO_TS_POWER)),
+-	    touch_rd(g_touch.tlmm, TLMM_CFG(GPIO_TS_RESET)), touch_rd(g_touch.tlmm, TLMM_IO(GPIO_TS_RESET)),
+-	    touch_rd(g_touch.tlmm, TLMM_CFG(GPIO_TS_IRQ)), touch_rd(g_touch.tlmm, TLMM_IO(GPIO_TS_IRQ)));
+-	if (err != 0) {
+-		/* which address does answer, if any (the other units' controllers) */
+-		static const uint8_t addrs[] = { 0x5d, 0x14, 0x20, 0x48 };
+-		uint8_t one;
+-		for (unsigned i = 0; i < sizeof(addrs); i++) {
+-			printf("SHAMROCK TOUCH: probe %#x -> %d\n", addrs[i], qup_xfer(addrs[i], true, &one, 1));
++	/* until the Himax answers: each power/reset variant in turn, one every ~10 s (repeated, so a late stall dump has them) */
++	{
++		int answers[4];
++		for (int v = 0;; v = (v + 1) % 4) {
++			err = hx_power_variant(v, answers);
++			if (err == 0) {
++				printf("SHAMROCK TOUCH: HX852x answers after power variant %d\n", v);
++				break;
++			}
++			touch_sleep_ms(10000);
+ 		}
+-	} else {
+-		hx_config();
+ 	}
++	hx_config();
+ 
+ 	for (;;) {
+ 		touch_sleep_ms(err ? 1000 : 8);
+@@ -471,6 +501,10 @@ sweet_touch_init(void)
+ 	for (int i = 0; i < 500 && (touch_rd(g_touch.gcc, GCC_QUP3_I2C_CBCR) & (1u << 31)); i++) {
+ 		delay(2);
+ 	}
++	g_touch.boot_cfg91 = touch_rd(g_touch.tlmm, TLMM_CFG(GPIO_TS_POWER));
++	g_touch.boot_io91 = touch_rd(g_touch.tlmm, TLMM_IO(GPIO_TS_POWER));
++	g_touch.boot_cfg64 = touch_rd(g_touch.tlmm, TLMM_CFG(GPIO_TS_RESET));
++	g_touch.boot_io64 = touch_rd(g_touch.tlmm, TLMM_IO(GPIO_TS_RESET));
+ 	/* pins: gpio10/11 to blsp_i2c3 (2 mA, no bias), irq gpio65 input with pull-up */
+ 	touch_wr(g_touch.tlmm, TLMM_CFG(GPIO_I2C_SDA), FUNC_BLSP_I2C3 << 2);
+ 	touch_wr(g_touch.tlmm, TLMM_CFG(GPIO_I2C_SCL), FUNC_BLSP_I2C3 << 2);
