@@ -1,0 +1,192 @@
+diff --git c/iokit/Kernel/arm/SweetFramebuffer.cpp i/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6bc981e..8b70b4e 100644
+--- c/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ i/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -54,6 +54,24 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #define SWEET_MDP_RGB0_PA       0x01a15000ULL   /* MDP base + 0x14000 */
+ #define SWEET_MDP_CTL0_FLUSH    0x18
+ #define SWEET_MDP_RGB0_SRC0     0x14
++
++/*
++ * shamrock: MDP scanout of the iOS surface itself through the VIG0 pipe (the only MSM8952 pipe that
++ * scales: Linux mdp5_cfg msm8x52, RGB pipes only decimate), bilinear 1242x2208 -> 1080x1920, no copy
++ * by this processor (r56: GL ~13 ms a frame, the rest of every frame was present()'s CPU scaling).
++ * State found on the phone (lk2nd): RGB0 is the base stage of CTL0 (LAYER0 0x200), SMP MMBs 0-1 belong
++ * to RGB0 (client 7), MMBs 2-7 are free; VIG0 (client 1) gets MMBs 2-5. A frame that is one full-screen
++ * contiguous BGRA surface goes to VIG0; any other frame is drawn by the processor into the panel buffers
++ * and RGB0 is the base stage again. sweetfb_mdp=0: never VIG0.
++ */
++#define SWEET_MDP_TOP_PA        0x01a01000ULL   /* SMP_ALLOC_W 0x80, SMP_ALLOC_R 0x130 */
++#define SWEET_MDP_VIG0_PA       0x01a05000ULL   /* MDP base + 0x4000 */
++#define SWEET_MDP_LAYER0        0x00            /* CTL0 */
++#define SWEET_FLUSH_VIG0        (1u << 0)
++#define SWEET_FLUSH_RGB0        (1u << 3)
++#define SWEET_FLUSH_LM0         (1u << 6)
++#define SWEET_FLUSH_CTL         (1u << 17)
++#define SWEET_FLUSH_ALL         (SWEET_FLUSH_VIG0 | SWEET_FLUSH_RGB0 | SWEET_FLUSH_LM0 | SWEET_FLUSH_CTL)
+ /* HakiosGPU.cpp: waits up to the given milliseconds for the GPU to finish drawing into the surface */
+ bool MiniIOSurfaceDrawn(SweetSurface *surface, uint64_t milliseconds);
+ 
+@@ -130,6 +148,12 @@ public:
+ 	volatile uint32_t *fMDP;        /* CTL0; NULL: one buffer */
+ 	volatile uint32_t *fRGB0;
+ 	IOMemoryMap  *fBuf1Map;
++	volatile uint32_t *fTop;        /* MDP top (SMP); NULL: no VIG0 scanout */
++	volatile uint32_t *fVIG0;
++	bool          fVigSetUp, fVigOn;
++	SweetSurface *fScanned[2];      /* [0] shown by VIG0 now, [1] flushed to be shown next */
++	uint32_t      fVigFrames, fCpuFrames;
++	bool presentMDP(const uint8_t *rec);
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+ 	IOLock       *fLock;            /* swaps and client list */
+@@ -253,6 +277,16 @@ AppleCLCD::start(IOService *provider)
+ 			fBuf[1] = fBuf1Map != NULL ? (uintptr_t)fBuf1Map->getVirtualAddress() : 0;
+ 			fMDP = (volatile uint32_t *)ml_io_map((vm_offset_t)SWEET_MDP_CTL0_PA, 0x1000);
+ 			fRGB0 = (volatile uint32_t *)ml_io_map((vm_offset_t)SWEET_MDP_RGB0_PA, 0x1000);
++			int vig = 0;
++			PE_parse_boot_argn("sweetfb_mdp", &vig, sizeof(vig));
++			if (vig) {
++				fTop = (volatile uint32_t *)ml_io_map((vm_offset_t)SWEET_MDP_TOP_PA, 0x1000);
++				fVIG0 = (volatile uint32_t *)ml_io_map((vm_offset_t)SWEET_MDP_VIG0_PA, 0x1000);
++				if (fTop == NULL || fVIG0 == NULL) {
++					fTop = NULL;
++					fVIG0 = NULL;
++				}
++			}
+ 			if (fBuf[1] == 0 || fMDP == NULL || fRGB0 == NULL) {
+ 				fMDP = NULL;
+ 			} else {
+@@ -391,6 +425,95 @@ static inline uint32_t lerp_pixel(uint32_t c0, uint32_t c1, uint32_t w)
+ 	return (rb & 0x00ff00ff) | ag;
+ }
+ 
++/*
++ * One frame by VIG0 if it is a single full-screen BGRA surface in physically contiguous memory:
++ * true if done (the surface is held until VIG0 has stopped reading it), false: draw it by hand.
++ */
++bool
++AppleCLCD::presentMDP(const uint8_t *rec)
++{
++	uint32_t mask = get32(rec, 0x104), id = 0, layers = 0;
++
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		if ((mask & (1u << layer)) && get32(rec, 0x54 + 4 * layer) != 0) {
++			layers++;
++			id = get32(rec, 0x54 + 4 * layer);
++		}
++	}
++	if (layers != 1) {
++		return false;
++	}
++	SweetSurface *s = sweet_surface_copy(id);
++	if (s == NULL || s == fSurface || s->memory == NULL || s->pixelFormat != SWEET_FB_FORMAT_BGRA ||
++	    s->bytesPerElement != 4 || s->width != fLogicalW || s->height != fLogicalH || (s->bytesPerRow & 15) != 0) {
++		OSSafeReleaseNULL(s);
++		return false;
++	}
++	IOByteCount len = 0;
++	addr64_t phys = s->memory->getPhysicalSegment(s->offset, &len, kIOMemoryMapperNone);
++	if (phys == 0 || phys + (uint64_t)s->bytesPerRow * s->height > 0x100000000ULL ||
++	    len < (IOByteCount)s->bytesPerRow * s->height) {
++		OSSafeReleaseNULL(s);
++		return false;
++	}
++	if (s->drawn != 0) {
++		(void)MiniIOSurfaceDrawn(s, 50);       /* the GPU is done with it */
++	}
++	__builtin_arm_dsb(0xf);
++	if (!fVigSetUp) {
++		/* SMP: MMB 2 (ALLOC reg 0, client field 2) and MMBs 3-5 (reg 1) to VIG0 (client 1) */
++		uint32_t w0 = (fTop[0x80 / 4] & 0x0000ffffu) | (1u << 16);
++		fTop[0x80 / 4] = w0;
++		fTop[0x130 / 4] = w0;
++		fTop[0x84 / 4] = 0x00010101u;
++		fTop[0x134 / 4] = 0x00010101u;
++		uint32_t sw = s->width, sh = s->height, dw = fWidth, dh = fHeight;
++		uint32_t stepx = (uint32_t)(((uint64_t)1 << 21) * sw / dw), stepy = (uint32_t)(((uint64_t)1 << 21) * sh / dh);
++		fVIG0[0x00 / 4] = (sh << 16) | sw;      /* SRC_SIZE */
++		fVIG0[0x04 / 4] = (sh << 16) | sw;      /* SRC_IMG_SIZE */
++		fVIG0[0x08 / 4] = 0;                    /* SRC_XY */
++		fVIG0[0x0c / 4] = (dh << 16) | dw;      /* OUT_SIZE */
++		fVIG0[0x10 / 4] = 0;                    /* OUT_XY */
++		fVIG0[0x30 / 4] = 0x000236ff;           /* SRC_FORMAT: XRGB8888 as the panel buffers (s1 shim) */
++		fVIG0[0x34 / 4] = 0x03020001;           /* UNPACK_PATTERN: B, G, R, X */
++		fVIG0[0x38 / 4] = 0;                    /* SRC_OP_MODE */
++		fVIG0[0x48 / 4] = 0x87;                 /* FETCH_CONFIG, as RGB0 */
++		fVIG0[0x50 / 4] = 0x100;                /* REQPRIO_FIFO_WM 0-2: 4 MMBs, RGB0's scale (2 MMBs: 0x80/0x100/0x180) */
++		fVIG0[0x54 / 4] = 0x200;
++		fVIG0[0x58 / 4] = 0x300;
++		fVIG0[0xb4 / 4] = 0;                    /* DECIMATION */
++		fVIG0[0x200 / 4] = 0;                   /* VIG OP_MODE: no CSC (RGB in, RGB out) */
++		fVIG0[0x210 / 4] = stepx;               /* SCALE_PHASE_STEP_X/Y, CR (the same for RGB) */
++		fVIG0[0x214 / 4] = stepy;
++		fVIG0[0x218 / 4] = stepx;
++		fVIG0[0x21c / 4] = stepy;
++		fVIG0[0x220 / 4] = 0;                   /* SCALE_INIT_PHASE_X/Y */
++		fVIG0[0x224 / 4] = 0;
++		fVIG0[0x204 / 4] = 0x3 | (1u << 8) | (1u << 10) | (1u << 12) | (1u << 14) | (1u << 16) | (1u << 18);   /* scale X, Y; bilinear */
++		fVigSetUp = true;
++		IOLog("SWEET FB: VIG0 scanout: %ux%u -> %ux%u bilinear, phase steps %#x %#x, SMP %#x/%#x\n", sw, sh, dw, dh,
++		    stepx, stepy, fTop[0x80 / 4], fTop[0x84 / 4]);
++	}
++	fVIG0[0x24 / 4] = s->bytesPerRow;               /* SRC_YSTRIDE0 */
++	fVIG0[0x14 / 4] = (uint32_t)phys;               /* SRC0_ADDR */
++	__builtin_arm_dsb(0xf);
++	if (!fVigOn) {
++		fMDP[SWEET_MDP_LAYER0 / 4] = 0x1;           /* VIG0 the base stage, RGB0 off the mixer */
++		fVigOn = true;
++		fMDP[SWEET_MDP_CTL0_FLUSH / 4] = fMDP[SWEET_MDP_CTL0_FLUSH / 4] | SWEET_FLUSH_VIG0 | SWEET_FLUSH_RGB0 |
++		    SWEET_FLUSH_LM0 | SWEET_FLUSH_CTL;
++	} else {
++		fMDP[SWEET_MDP_CTL0_FLUSH / 4] = fMDP[SWEET_MDP_CTL0_FLUSH / 4] | SWEET_FLUSH_VIG0;
++	}
++	__builtin_arm_dsb(0xf);
++	OSSafeReleaseNULL(fScanned[1]);
++	fScanned[1] = s;                                /* (held: VIG0 reads it from the next vsync on) */
++	if ((++fVigFrames % 600) == 1) {
++		IOLog("SWEET FB: %u frames by VIG0, %u by the processor\n", fVigFrames, fCpuFrames);
++	}
++	return true;
++}
++
+ void
+ AppleCLCD::present(const uint8_t *rec)
+ {
+@@ -401,9 +524,18 @@ AppleCLCD::present(const uint8_t *rec)
+ 
+ 	if (fMDP != NULL) {
+ 		/* the last flip must have happened (its flush bit clears at the vsync that takes it) */
+-		for (int i = 0; i < 400 && (fMDP[SWEET_MDP_CTL0_FLUSH / 4] & 0x8); i++) {
++		for (int i = 0; i < 400 && (fMDP[SWEET_MDP_CTL0_FLUSH / 4] & SWEET_FLUSH_ALL); i++) {
+ 			IODelay(50);
+ 		}
++		/* what VIG0 was given last is shown now: the one before can go */
++		if (fScanned[1] != NULL) {
++			OSSafeReleaseNULL(fScanned[0]);
++			fScanned[0] = fScanned[1];
++			fScanned[1] = NULL;
++		}
++		if (fTop != NULL && presentMDP(rec)) {
++			return;
++		}
+ 		draw = fBuf[back];
+ 	}
+ 
+@@ -614,7 +746,15 @@ AppleCLCD::present(const uint8_t *rec)
+ 	if (fMDP != NULL && drew) {
+ 		__builtin_arm_dsb(0xf);
+ 		fRGB0[SWEET_MDP_RGB0_SRC0 / 4] = (uint32_t)fBufPhys[back];
+-		fMDP[SWEET_MDP_CTL0_FLUSH / 4] = fMDP[SWEET_MDP_CTL0_FLUSH / 4] | 0x8;
++		if (fVigOn) {
++			fMDP[SWEET_MDP_LAYER0 / 4] = 0x200;     /* RGB0 the base stage again */
++			fVigOn = false;
++			fMDP[SWEET_MDP_CTL0_FLUSH / 4] = fMDP[SWEET_MDP_CTL0_FLUSH / 4] | SWEET_FLUSH_RGB0 | SWEET_FLUSH_VIG0 |
++			    SWEET_FLUSH_LM0 | SWEET_FLUSH_CTL;
++		} else {
++			fMDP[SWEET_MDP_CTL0_FLUSH / 4] = fMDP[SWEET_MDP_CTL0_FLUSH / 4] | SWEET_FLUSH_RGB0;
++		}
++		fCpuFrames++;
+ 		__builtin_arm_dsb(0xf);
+ 		fFront = back;
+ 	}
