@@ -1,0 +1,47 @@
+diff --git c/osfmk/arm64/machine_routines.c i/osfmk/arm64/machine_routines.c
+index 5ffc8cc..cd0b712 100644
+--- c/osfmk/arm64/machine_routines.c
++++ i/osfmk/arm64/machine_routines.c
+@@ -976,6 +976,21 @@ ml_parse_cpu_topology(void)
+ 
+ 	while (kSuccess == SecureDTIterateEntries(&iter, &child)) {
+ 		boolean_t is_boot_cpu = ml_is_boot_cpu(child);
++#if defined(SWEET)
++		{
++			/* r47full: two "running" CPUs right after a RAM layout change; show what the DT says */
++			extern void sweet_early_print(const char *s);
++			void const *nm = NULL, *st = NULL;
++			unsigned int nmsz = 0, stsz = 0;
++			char line[96];
++			(void)SecureDTGetProperty(child, "name", &nm, &nmsz);
++			(void)SecureDTGetProperty(child, "state", &st, &stsz);
++			snprintf(line, sizeof(line), "SWEET CPU %.8s state %.8s (%u bytes) reg %#llx boot %d entry %p\n",
++			    nm ? (const char *)nm : "?", st ? (const char *)st : "?", stsz,
++			    (unsigned long long)ml_readprop(child, "reg", ~0ULL), is_boot_cpu, (const void *)child);
++			sweet_early_print(line);
++		}
++#endif
+ 		boolean_t cpu_enabled = cpumask_boot_arg & 1;
+ 		cpumask_boot_arg >>= 1;
+ 
+diff --git c/osfmk/arm64/sweet_early.c i/osfmk/arm64/sweet_early.c
+index e1021e0..9b77ec7 100644
+--- c/osfmk/arm64/sweet_early.c
++++ i/osfmk/arm64/sweet_early.c
+@@ -87,6 +87,16 @@ sweet_early_string(const char *s)
+ 	}
+ }
+ 
++/* shamrock: one free-form line on the early console (while it is still on) */
++void sweet_early_print(const char *s);
++void
++sweet_early_print(const char *s)
++{
++	if (!early_disabled) {
++		sweet_early_string(s);
++	}
++}
++
+ void
+ sweet_early_mark(unsigned int stage, const char *label)
+ {
