@@ -1,0 +1,92 @@
+diff --git c/iokit/Kernel/arm/HakiosGPU.cpp i/iokit/Kernel/arm/HakiosGPU.cpp
+index 6a8cb73..4d6619d 100644
+--- c/iokit/Kernel/arm/HakiosGPU.cpp
++++ i/iokit/Kernel/arm/HakiosGPU.cpp
+@@ -57,6 +57,73 @@ static inline void MiniIOSurfaceDrop(MiniIOSurface *s) { if (s != NULL) { s->rel
+ 
+ extern "C" void hakios_tl(const char * format, ...) __printflike(1, 2);
+ 
++/*
++ * shamrock: a GEM buffer whose pages are really write-combined. kIOMapWriteCombineCache on an
++ * IOBufferMemoryDescriptor only sets the cache mode of later mappings; the pages stayed
++ * cacheable where it mattered and the GPU read stale lines of what Mesa wrote (speckles in the
++ * clock's glyphs, noise under the dock). As ios-river 0192: set the pages' own cache attribute
++ * (pmap_set_cache_attributes, every mapping follows) once they are clean, and give it back
++ * before they return to the VM.
++ */
++extern "C" void pmap_set_cache_attributes(ppnum_t pn, unsigned int cacheattr);
++extern "C" ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern "C" const pmap_t kernel_pmap;
++#define HAKIOS_WIMG_WCOMB       0x6     /* VM_WIMG_WCOMB (osfmk/arm/memory_types.h) */
++#define HAKIOS_WIMG_DEFAULT     0x2     /* VM_WIMG_DEFAULT */
++
++class HakiosGPUMemory : public IOBufferMemoryDescriptor
++{
++	OSDeclareDefaultStructors(HakiosGPUMemory);
++public:
++	static HakiosGPUMemory * make(IOOptionBits options, vm_size_t size);
++protected:
++	virtual void free() APPLE_KEXT_OVERRIDE;
++private:
++	void setPagesCache(unsigned int wimg);
++	bool fUncached;
++};
++
++OSDefineMetaClassAndStructors(HakiosGPUMemory, IOBufferMemoryDescriptor);
++
++void
++HakiosGPUMemory::setPagesCache(unsigned int wimg)
++{
++	uint8_t * va = (uint8_t *) getBytesNoCopy();
++
++	for (vm_size_t o = 0; va != NULL && o < getCapacity(); o += PAGE_SIZE) {
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)(uintptr_t)(va + o));
++		if (pn != 0) {
++			pmap_set_cache_attributes(pn, wimg);
++		}
++	}
++}
++
++HakiosGPUMemory *
++HakiosGPUMemory::make(IOOptionBits options, vm_size_t size)
++{
++	HakiosGPUMemory * m = OSTypeAlloc(HakiosGPUMemory);
++
++	if (m == NULL || !m->initWithPhysicalMask(kernel_task, options, size, PAGE_SIZE, 0)) {
++		OSSafeReleaseNULL(m);
++		return NULL;
++	}
++	/* (zeroed through the cached kernel view: out of the cache first, then uncached for good) */
++	flush_dcache64((addr64_t)(uintptr_t)m->getBytesNoCopy(), (unsigned) size, FALSE);
++	m->setPagesCache(HAKIOS_WIMG_WCOMB);
++	m->fUncached = true;
++	return m;
++}
++
++void
++HakiosGPUMemory::free()
++{
++	if (fUncached) {
++		setPagesCache(HAKIOS_WIMG_DEFAULT);
++		fUncached = false;
++	}
++	IOBufferMemoryDescriptor::free();
++}
++
+ extern "C" {
+ /* drivers/gpu/hakios.adreno.c ("the GPU kept on"; declared in bsd/sys/hakios.input.h, which is not seen from here) */
+ bool hakios_gpu_ready(void);
+@@ -830,8 +897,11 @@ HakiosGPUUserClient::gemNew(struct msm_gem_new * request)
+ 	}
+ 	if (memory == NULL) {
+ 		/* (the memory comes zeroed, and making it write-combined pushes the zeroes out of the cache) */
+-		IOBufferMemoryDescriptor * vm = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
+-		    (smmu ? 0 : kIOMemoryPhysicallyContiguous) | (gGPUCached ? 0 : kIOMapWriteCombineCache), (vm_size_t) size, PAGE_SIZE);
++		IOBufferMemoryDescriptor * vm = (!gGPUCached) ?
++		    HakiosGPUMemory::make(kIODirectionInOut | kIOMemoryKernelUserShared |
++		    (smmu ? 0 : kIOMemoryPhysicallyContiguous) | kIOMapWriteCombineCache, (vm_size_t) size) :
++		    IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
++		    (smmu ? 0 : kIOMemoryPhysicallyContiguous), (vm_size_t) size, PAGE_SIZE);
+ 		memory = vm;
+ 		if (vm != NULL) {
+ 			kernel = (uint8_t *) vm->getBytesNoCopy();
