@@ -1,0 +1,739 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 6156a4d..1443564 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1,7 +1,16 @@
+ /*
+- * SWEET / SHAMROCK Touchscreen Driver
+- * Supports Qualcomm QUP v2.4 I2C (blsp1_i2c3 @ 0x078b7000)
+- * Goodix GT970 / GT911 Touchscreen on General Mobile GM 5 Plus (shamrock)
++ * SWEET / SHAMROCK touchscreen driver, polled.
++ *
++ * General Mobile GM 5 Plus (shamrock): blsp1_i2c3 (QUP v2.2.1 @ 0x078b7000) with a Himax
++ * HX852x(ES) at 0x48 on this unit (pmOS i2cdetect: only 0x48 answers; the DT also lists
++ * Synaptics 0x20 and Goodix 0x5d for other units). Touch power is TLMM gpio91 (an LDO
++ * enable), reset gpio64 (active low), interrupt gpio65.
++ *
++ * lk2nd leaves all of that alone: the I2C pins (gpio10/11) are plain GPIOs, the touch LDO
++ * is off. So: mux gpio10/11 to blsp_i2c3, enable the QUP3 I2C and BLSP1 AHB clocks, power
++ * the controller, pulse reset, then poll it. The QUP is driven like Linux i2c-qup.c's v2
++ * FIFO path (V2 tags, polled instead of interrupt driven), one message per QUP run;
++ * protocol per Linux himax_hx852x.c.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -14,7 +23,6 @@
+ #include <pexpert/pexpert.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+-extern kern_return_t thread_terminate(thread_t);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void sweet_touch_init(void);
+ 
+@@ -22,15 +30,17 @@ void sweet_touch_init(void);
+ #define SHAMROCK_GCC_PA     0x01800000u
+ #define SHAMROCK_TLMM_PA    0x01000000u
+ 
+-/* QUP v2 Registers */
++/* QUP registers (Linux i2c-qup.c) */
+ #define QUP_CONFIG          0x000u
+ #define QUP_STATE           0x004u
+ #define QUP_IO_MODE         0x008u
+ #define QUP_SW_RESET        0x00cu
+ #define QUP_OPERATIONAL     0x018u
+ #define QUP_ERROR_FLAGS     0x01cu
++#define QUP_MX_OUTPUT_CNT   0x100u
+ #define QUP_OUT_FIFO_BASE   0x110u
+ #define QUP_MX_WRITE_CNT    0x150u
++#define QUP_MX_INPUT_CNT    0x200u
+ #define QUP_MX_READ_CNT     0x208u
+ #define QUP_IN_FIFO_BASE    0x218u
+ #define QUP_I2C_CLK_CTL     0x400u
+@@ -40,40 +50,77 @@ void sweet_touch_init(void);
+ #define QUP_RESET_STATE     0u
+ #define QUP_RUN_STATE       1u
+ #define QUP_PAUSE_STATE     3u
++#define QUP_STATE_MASK      3u
+ #define QUP_STATE_VALID     (1u << 2)
+ 
++#define QUP_OUT_NOT_EMPTY   (1u << 4)
++#define QUP_IN_NOT_EMPTY    (1u << 5)
++#define QUP_MX_OUTPUT_DONE  (1u << 10)
++#define QUP_NO_INPUT        (1u << 7)
++#define I2C_MINI_CORE       (2u << 8)
++#define I2C_N_VAL_V2        7u
++#define QUP_REPACK_EN       ((1u << 14) | (1u << 15))
++#define QUP_V2_TAGS_EN      1u
++
++#define I2C_STATUS_NACK         (1u << 3)
++#define I2C_STATUS_BUS_ACTIVE   (1u << 8)
++#define I2C_STATUS_ERROR_MASK   0x38000fcu
++#define QUP_STATUS_ERROR_FLAGS  0x7cu
++
+ #define QUP_TAG_V2_START       0x81u
+-#define QUP_TAG_V2_DATAWR      0x82u
+ #define QUP_TAG_V2_DATAWR_STOP 0x83u
+-#define QUP_TAG_V2_DATARD      0x85u
+ #define QUP_TAG_V2_DATARD_STOP 0x87u
+ 
+-/* GCC Clock Registers for BLSP1 QUP3 */
+-#define GCC_QUP3_RCG_CMD    0x4000u
+-#define GCC_QUP3_RCG_CFG    0x4004u
+-#define GCC_QUP3_BRANCH     0x4020u
++/* 19.2 MHz source (XO), 400 kHz: Linux's fast-mode divider (33%/66% duty) */
++#define QUP_FS_DIV          (((19200000u / 400000u) - 6u) * 2u / 3u)
++#define QUP_CLK_CTL_400K    (((QUP_FS_DIV / 2u) << 16) | (3u << 8) | (QUP_FS_DIV & 0xffu))
+ 
+-/* TLMM GPIO Registers (GPIO 64 = Reset, GPIO 65 = IRQ) */
+-#define TLMM_GPIO_CFG(n)    ((uint32_t)(n) * 0x1000u)
+-#define TLMM_GPIO_IN_OUT(n) (TLMM_GPIO_CFG(n) + 4u)
++/* GCC (Linux gcc-msm8952.c) */
++#define GCC_QUP3_I2C_RCGR   0x04000u
++#define GCC_QUP3_I2C_CBCR   0x04020u
++#define GCC_APCS_VOTE       0x45004u    /* bit 10: BLSP1 AHB */
+ 
+-#define GOODIX_I2C_ADDR     0x5du
+-#define GOODIX_REG_ID       0x8140u
+-#define GOODIX_READ_COOR    0x814Eu
++/* TLMM (Linux pinctrl-msm8952.c): cfg at 0x1000 * n, io at +4; func [5:2], oe bit 9, pull [1:0] */
++#define TLMM_CFG(n)         ((uint32_t)(n) * 0x1000u)
++#define TLMM_IO(n)          (TLMM_CFG(n) + 4u)
++#define TLMM_PULL_UP        3u
++#define TLMM_OE             (1u << 9)
++#define GPIO_I2C_SDA        10
++#define GPIO_I2C_SCL        11
++#define GPIO_TS_RESET       64
++#define GPIO_TS_IRQ         65
++#define GPIO_TS_POWER       91
++#define FUNC_BLSP_I2C3      3u
++
++/* Himax HX852x (Linux himax_hx852x.c) */
++#define HX_ADDR             0x48u
++#define HX_SLEEP_IN         0x80u
++#define HX_SLEEP_OUT        0x81u
++#define HX_SENSE_OFF        0x82u
++#define HX_SENSE_ON         0x83u
++#define HX_READ_ALL_EVENTS  0x86u
++#define HX_REG_SRAM_SWITCH  0x8cu
++#define HX_REG_SRAM_ADDR    0x8bu
++#define HX_REG_FLASH_RPLACE 0x5au
++#define HX_MAX_FINGERS      12
+ 
+ static struct {
+ 	vm_offset_t qup, gcc, tlmm;
+-	bool started, detected;
++	bool started;
+ 	int sleep_chan;
+-	int last_contacts;
+-	uint16_t last_x[10], last_y[10];
++	uint32_t in_fifo, out_fifo;
++	uint32_t last_i2c, last_err;
++	unsigned fingers;
++	unsigned xres, yres;
++	uint32_t down_mask;
++	uint16_t last_x[HX_MAX_FINGERS], last_y[HX_MAX_FINGERS];
+ } g_touch;
+ 
+ static inline uint32_t
+ touch_rd(vm_offset_t base, uint32_t off)
+ {
+ 	uint32_t v = *(volatile uint32_t *)(base + off);
+-	__asm__ volatile("dmb oshld" ::: "memory");
++	__asm__ volatile ("dmb oshld" ::: "memory");
+ 	return v;
+ }
+ 
+@@ -81,7 +128,7 @@ static inline void
+ touch_wr(vm_offset_t base, uint32_t off, uint32_t val)
+ {
+ 	*(volatile uint32_t *)(base + off) = val;
+-	__asm__ volatile("dsb osh" ::: "memory");
++	__asm__ volatile ("dsb osh" ::: "memory");
+ }
+ 
+ static void
+@@ -93,313 +140,343 @@ touch_sleep_ms(uint32_t ms)
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
+-static bool
+-qup_change_state(uint32_t state)
++static int
++qup_poll_state(uint32_t want, uint32_t mask)
+ {
+ 	for (int i = 0; i < 1000; i++) {
+-		if (touch_rd(g_touch.qup, QUP_STATE) & QUP_STATE_VALID) {
+-			break;
++		uint32_t s = touch_rd(g_touch.qup, QUP_STATE);
++		if ((s & QUP_STATE_VALID) && (s & mask) == want) {
++			return 0;
+ 		}
+-		delay(5);
++		delay(1);
++	}
++	return ETIMEDOUT;
++}
++
++static int
++qup_set_state(uint32_t state)
++{
++	if (qup_poll_state(0, 0)) {
++		return EIO;
+ 	}
+ 	touch_wr(g_touch.qup, QUP_STATE, state);
+-	for (int i = 0; i < 1000; i++) {
+-		uint32_t s = touch_rd(g_touch.qup, QUP_STATE);
+-		if ((s & QUP_STATE_VALID) && ((s & 3u) == state)) {
+-			return true;
+-		}
+-		delay(5);
++	return qup_poll_state(state, QUP_STATE_MASK);
++}
++
++/*
++ * One I2C message: a write of `len` bytes, or a read of `len` bytes, with START and STOP.
++ * 0, ENXIO (NACK), EIO (bus/QUP error), EINVAL or ETIMEDOUT.
++ */
++static int
++qup_xfer(uint8_t addr, bool rd, uint8_t *buf, uint32_t len)
++{
++	uint8_t tx[4 + 64];
++	uint32_t ntx = 0, nrx = rd ? len + 2 : 0;     /* a read gets its two tags back first */
++	uint32_t got = 0, word = 0;
++	int ret;
++
++	if (len == 0 || len > 64 || (rd && nrx > g_touch.in_fifo) || (!rd && 4 + len > g_touch.out_fifo)) {
++		return EINVAL;
+ 	}
+-	return false;
++	tx[ntx++] = QUP_TAG_V2_START;
++	tx[ntx++] = (uint8_t)((addr << 1) | (rd ? 1 : 0));
++	tx[ntx++] = rd ? QUP_TAG_V2_DATARD_STOP : QUP_TAG_V2_DATAWR_STOP;
++	tx[ntx++] = (uint8_t)len;
++	if (!rd) {
++		for (uint32_t i = 0; i < len; i++) {
++			tx[ntx++] = buf[i];
++		}
++	}
++
++	touch_wr(g_touch.qup, QUP_SW_RESET, 1);
++	if (qup_poll_state(QUP_RESET_STATE, QUP_STATE_MASK)) {
++		return EIO;
++	}
++	touch_wr(g_touch.qup, QUP_I2C_MASTER_GEN, QUP_V2_TAGS_EN);
++	touch_wr(g_touch.qup, QUP_IO_MODE, QUP_REPACK_EN);
++	touch_wr(g_touch.qup, QUP_MX_OUTPUT_CNT, 0);
++	touch_wr(g_touch.qup, QUP_MX_INPUT_CNT, 0);
++	touch_wr(g_touch.qup, QUP_MX_WRITE_CNT, ntx);
++	touch_wr(g_touch.qup, QUP_MX_READ_CNT, nrx);
++	touch_wr(g_touch.qup, QUP_CONFIG, I2C_MINI_CORE | I2C_N_VAL_V2 | (rd ? 0 : QUP_NO_INPUT));
++
++	if ((ret = qup_set_state(QUP_RUN_STATE))) {
++		return ret;
++	}
++	touch_wr(g_touch.qup, QUP_I2C_CLK_CTL, QUP_CLK_CTL_400K);
++	if ((ret = qup_set_state(QUP_PAUSE_STATE))) {
++		return ret;
++	}
++	for (uint32_t i = 0; i < ntx; i += 4) {
++		uint32_t w = 0;
++		for (uint32_t j = 0; j < 4 && i + j < ntx; j++) {
++			w |= (uint32_t)tx[i + j] << (8 * j);
++		}
++		touch_wr(g_touch.qup, QUP_OUT_FIFO_BASE, w);
++	}
++	if ((ret = qup_set_state(QUP_RUN_STATE))) {
++		return ret;
++	}
++
++	ret = ETIMEDOUT;
++	for (int spin = 0; spin < 20000; spin++) {      /* ~20 ms: 66 bytes at 400 kHz take 1.5 ms */
++		uint32_t i2c = touch_rd(g_touch.qup, QUP_I2C_STATUS);
++		uint32_t err = touch_rd(g_touch.qup, QUP_ERROR_FLAGS) & QUP_STATUS_ERROR_FLAGS;
++		uint32_t op = touch_rd(g_touch.qup, QUP_OPERATIONAL);
++
++		if ((i2c & I2C_STATUS_ERROR_MASK) || err) {
++			g_touch.last_i2c = i2c;
++			g_touch.last_err = err;
++			ret = (i2c & I2C_STATUS_NACK) ? ENXIO : EIO;
++			break;
++		}
++		if (rd) {
++			while (got < nrx && (touch_rd(g_touch.qup, QUP_OPERATIONAL) & QUP_IN_NOT_EMPTY)) {
++				word = touch_rd(g_touch.qup, QUP_IN_FIFO_BASE);
++				for (uint32_t j = 0; j < 4 && got < nrx; j++, got++) {
++					if (got >= 2) {
++						buf[got - 2] = (uint8_t)(word >> (8 * j));
++					}
++				}
++			}
++			if (got >= nrx && !(i2c & I2C_STATUS_BUS_ACTIVE)) {
++				ret = 0;
++				break;
++			}
++		} else if ((op & QUP_MX_OUTPUT_DONE) && !(op & QUP_OUT_NOT_EMPTY) && !(i2c & I2C_STATUS_BUS_ACTIVE)) {
++			ret = 0;
++			break;
++		}
++		delay(1);
++	}
++	touch_wr(g_touch.qup, QUP_OPERATIONAL, 0x000ff0u);    /* clear the service flags */
++	(void)qup_set_state(QUP_RESET_STATE);
++	return ret;
++}
++
++static int
++hx_cmd(uint8_t cmd)
++{
++	return qup_xfer(HX_ADDR, false, &cmd, 1);
++}
++
++static int
++hx_read(uint8_t cmd, uint8_t *buf, uint32_t len)
++{
++	int ret = qup_xfer(HX_ADDR, false, &cmd, 1);
++	return ret ? ret : qup_xfer(HX_ADDR, true, buf, len);
+ }
+ 
+ static void
+-qup_init_bus(void)
++gpio_out(int n, int level)
+ {
+-	/* 1. Enable parent RCG clock (CMD_ROOT_EN) and branch clock */
+-	touch_wr(g_touch.gcc, GCC_QUP3_RCG_CMD, 2);
+-	touch_wr(g_touch.gcc, GCC_QUP3_BRANCH, 1);
+-	for (int i = 0; i < 500 && (touch_rd(g_touch.gcc, GCC_QUP3_BRANCH) & (1u << 31)); i++) {
+-		delay(2);
+-	}
+-
+-	/* 2. Reset QUP core */
+-	touch_wr(g_touch.qup, QUP_SW_RESET, 1);
+-	delay(20);
+-	qup_change_state(QUP_RESET_STATE);
+-
+-	/* 3. Configure Mini-Core for I2C with V2 tags & Repack mode */
+-	touch_wr(g_touch.qup, QUP_CONFIG, 0x0207); /* I2C_MINI_CORE | N_VAL_V2 */
+-	touch_wr(g_touch.qup, QUP_IO_MODE, 0xc000); /* REPACK_EN */
+-	touch_wr(g_touch.qup, QUP_I2C_MASTER_GEN, 1); /* V2_TAGS_EN */
+-
+-	/* 4. Set I2C frequency (100 kHz) */
+-	qup_change_state(QUP_RUN_STATE);
+-	touch_wr(g_touch.qup, QUP_I2C_CLK_CTL, 0x035d);
+-	qup_change_state(QUP_PAUSE_STATE);
++	touch_wr(g_touch.tlmm, TLMM_IO(n), level ? 2u : 0u);
++	touch_wr(g_touch.tlmm, TLMM_CFG(n), TLMM_OE);
+ }
+ 
+-/* Perform I2C Write */
+ static int
+-qup_i2c_write(uint8_t addr, const uint8_t *buf, uint32_t len)
++hx_probe(void)
+ {
+-	qup_init_bus();
++	uint8_t one;
++	int err;
+ 
+-	/* START, addr_wr, DATAWR_STOP, len */
+-	uint32_t tag_word = QUP_TAG_V2_START |
+-	                    ((uint32_t)(addr << 1) << 8) |
+-	                    ((uint32_t)QUP_TAG_V2_DATAWR_STOP << 16) |
+-	                    ((uint32_t)len << 24);
+-
+-	touch_wr(g_touch.qup, QUP_CONFIG, 0x0207 | (1u << 7)); /* NO_INPUT */
+-	touch_wr(g_touch.qup, QUP_MX_WRITE_CNT, 4 + len);
+-	touch_wr(g_touch.qup, QUP_OUT_FIFO_BASE, tag_word);
+-
+-	/* Write payload data in 32-bit packed words */
+-	uint32_t word = 0;
+-	int b = 0;
+-	for (uint32_t i = 0; i < len; i++) {
+-		word |= (uint32_t)buf[i] << (b * 8);
+-		if (++b == 4) {
+-			touch_wr(g_touch.qup, QUP_OUT_FIFO_BASE, word);
+-			word = 0;
+-			b = 0;
++	/* power on (LDO via gpio91), reset low 20 ms, release, give the firmware time */
++	gpio_out(GPIO_TS_POWER, 1);
++	touch_sleep_ms(20);
++	gpio_out(GPIO_TS_RESET, 0);
++	touch_sleep_ms(20);
++	gpio_out(GPIO_TS_RESET, 1);
++	touch_sleep_ms(100);
++	err = qup_xfer(HX_ADDR, true, &one, 1);
++	if (err == ENXIO) {
++		/* (pmOS described reset as active high: try leaving it low) */
++		gpio_out(GPIO_TS_RESET, 0);
++		touch_sleep_ms(100);
++		int err2 = qup_xfer(HX_ADDR, true, &one, 1);
++		printf("SHAMROCK TOUCH: 0x48 NACK with reset high; with reset low -> %d\n", err2);
++		if (err2 != 0) {
++			gpio_out(GPIO_TS_RESET, 1);
+ 		}
++		err = err2;
+ 	}
+-	if (b > 0) {
+-		touch_wr(g_touch.qup, QUP_OUT_FIFO_BASE, word);
+-	}
+-
+-	qup_change_state(QUP_RUN_STATE);
+-
+-	/* Wait for completion */
+-	for (int i = 0; i < 500; i++) {
+-		uint32_t op = touch_rd(g_touch.qup, QUP_OPERATIONAL);
+-		uint32_t err = touch_rd(g_touch.qup, QUP_ERROR_FLAGS);
+-		uint32_t i2c_st = touch_rd(g_touch.qup, QUP_I2C_STATUS);
+-		if (err || (i2c_st & (1u << 3))) {
+-			qup_change_state(QUP_RESET_STATE);
+-			return EIO;
+-		}
+-		if (op & (1u << 8)) { /* OUT_SVC_FLAG */
+-			touch_wr(g_touch.qup, QUP_OPERATIONAL, op & 0x000ff0);
+-			return 0;
+-		}
+-		delay(20);
+-	}
+-	qup_change_state(QUP_RESET_STATE);
+-	return ETIMEDOUT;
++	return err;
+ }
+ 
+-/* Perform I2C Read */
+-static int
+-qup_i2c_read(uint8_t addr, uint8_t *buf, uint32_t len)
++static void
++hx_config(void)
+ {
+-	qup_init_bus();
++	uint8_t conf[12] = { 0 };
++	uint8_t w2[2], w3[3];
++	int e1, e2, e3, e4;
+ 
+-	/* START, addr_rd, DATARD_STOP, len */
+-	uint32_t tag_word = QUP_TAG_V2_START |
+-	                    ((uint32_t)((addr << 1) | 1) << 8) |
+-	                    ((uint32_t)QUP_TAG_V2_DATARD_STOP << 16) |
+-	                    ((uint32_t)len << 24);
+-
+-	touch_wr(g_touch.qup, QUP_CONFIG, 0x0207); /* INPUT enabled */
+-	touch_wr(g_touch.qup, QUP_MX_WRITE_CNT, 4);
+-	touch_wr(g_touch.qup, QUP_MX_READ_CNT, 2 + len); /* 2 tags + len data */
+-	touch_wr(g_touch.qup, QUP_OUT_FIFO_BASE, tag_word);
+-
+-	qup_change_state(QUP_RUN_STATE);
+-
+-	/* Wait for RX data */
+-	for (int i = 0; i < 500; i++) {
+-		uint32_t op = touch_rd(g_touch.qup, QUP_OPERATIONAL);
+-		uint32_t err = touch_rd(g_touch.qup, QUP_ERROR_FLAGS);
+-		uint32_t i2c_st = touch_rd(g_touch.qup, QUP_I2C_STATUS);
+-		if (err || (i2c_st & (1u << 3))) {
+-			qup_change_state(QUP_RESET_STATE);
+-			return EIO;
++	g_touch.fingers = 10;
++	g_touch.xres = 1080;
++	g_touch.yres = 1920;
++	/* sensing on briefly loads the config (Linux hx852x_read_config) */
++	e1 = hx_cmd(HX_SLEEP_OUT);
++	touch_sleep_ms(30);
++	(void)hx_cmd(HX_SENSE_ON);
++	touch_sleep_ms(20);
++	(void)hx_cmd(HX_SENSE_OFF);
++	touch_sleep_ms(20);
++	(void)hx_cmd(HX_SLEEP_IN);
++	touch_sleep_ms(30);
++	w2[0] = HX_REG_SRAM_SWITCH;
++	w2[1] = 0x14;
++	e2 = qup_xfer(HX_ADDR, false, w2, 2);
++	w3[0] = HX_REG_SRAM_ADDR;               /* smbus word 0x7000, low byte first */
++	w3[1] = 0x00;
++	w3[2] = 0x70;
++	e3 = qup_xfer(HX_ADDR, false, w3, 3);
++	e4 = hx_read(HX_REG_FLASH_RPLACE, conf, sizeof(conf));
++	w2[0] = HX_REG_SRAM_SWITCH;
++	w2[1] = 0;
++	(void)qup_xfer(HX_ADDR, false, w2, 2);
++	if (e4 == 0) {
++		unsigned f = (conf[2] & 0xf0u) >> 4;
++		unsigned x = ((unsigned)conf[6] << 8) | conf[7];
++		unsigned y = ((unsigned)conf[8] << 8) | conf[9];
++		if (f > 0 && f <= HX_MAX_FINGERS) {
++			g_touch.fingers = f;
+ 		}
+-		if (op & (1u << 9)) { /* IN_SVC_FLAG */
+-			touch_wr(g_touch.qup, QUP_OPERATIONAL, 1u << 9);
+-
+-			/* Read words from IN_FIFO */
+-			uint32_t total = 2 + len;
+-			uint32_t fetched = 0;
+-			uint8_t raw[32];
+-			while (fetched < total && fetched < sizeof(raw)) {
+-				uint32_t w = touch_rd(g_touch.qup, QUP_IN_FIFO_BASE);
+-				raw[fetched++] = (uint8_t)(w & 0xff);
+-				if (fetched < total) raw[fetched++] = (uint8_t)((w >> 8) & 0xff);
+-				if (fetched < total) raw[fetched++] = (uint8_t)((w >> 16) & 0xff);
+-				if (fetched < total) raw[fetched++] = (uint8_t)((w >> 24) & 0xff);
+-			}
+-			/* Skip 2 tag bytes, copy payload */
+-			for (uint32_t j = 0; j < len; j++) {
+-				buf[j] = raw[2 + j];
+-			}
+-			return 0;
++		if (x && y) {
++			g_touch.xres = x;
++			g_touch.yres = y;
+ 		}
+-		delay(20);
+ 	}
+-	qup_change_state(QUP_RESET_STATE);
+-	return ETIMEDOUT;
++	printf("SHAMROCK TOUCH: HX852x config errs %d/%d/%d/%d: rx %u tx %u fingers %u, %u x %u\n",
++	    e1, e2, e3, e4, conf[0], conf[1], g_touch.fingers, g_touch.xres, g_touch.yres);
++	(void)hx_cmd(HX_SLEEP_OUT);
++	touch_sleep_ms(30);
++	(void)hx_cmd(HX_SENSE_ON);
++	touch_sleep_ms(20);
+ }
+ 
+-/* Goodix Read Register (Write 16-bit reg address, then read N bytes) */
++/* One poll: READ_ALL_EVENTS = coords[f] (be16 x, be16 y), widths[ALIGN(f,4)], info{finger_num, le16 pressed, pad} */
+ static int
+-goodix_read_reg(uint16_t reg, uint8_t *buf, uint32_t len)
++hx_poll(uint32_t *events)
+ {
+-	uint8_t reg_addr[2] = { (uint8_t)(reg >> 8), (uint8_t)(reg & 0xff) };
+-	int ret = qup_i2c_write(GOODIX_I2C_ADDR, reg_addr, 2);
+-	if (ret != 0) {
+-		return ret;
+-	}
+-	return qup_i2c_read(GOODIX_I2C_ADDR, buf, len);
+-}
++	uint8_t buf[HX_MAX_FINGERS * 4 + 12 + 4];
++	unsigned f = g_touch.fingers;
++	unsigned wlen = (f + 3) & ~3u;
++	int err = hx_read(HX_READ_ALL_EVENTS, buf, f * 4 + wlen + 4);
+ 
+-/* Goodix Write Byte to Register */
+-static int
+-goodix_write_u8(uint16_t reg, uint8_t val)
+-{
+-	uint8_t payload[3] = { (uint8_t)(reg >> 8), (uint8_t)(reg & 0xff), val };
+-	return qup_i2c_write(GOODIX_I2C_ADDR, payload, 3);
++	if (err) {
++		return err;
++	}
++	uint8_t *info = &buf[f * 4 + wlen];
++	uint32_t pressed = (uint32_t)info[1] | ((uint32_t)info[2] << 8);
++	if (info[0] == 0xff || !(info[0] & 0x0f)) {
++		pressed = 0;
++	}
++	pressed &= (1u << f) - 1;
++	for (unsigned i = 0; i < f; i++) {
++		if (pressed & (1u << i)) {
++			unsigned x = ((unsigned)buf[i * 4] << 8) | buf[i * 4 + 1];
++			unsigned y = ((unsigned)buf[i * 4 + 2] << 8) | buf[i * 4 + 3];
++			int px = (int)(x * 1080u / g_touch.xres);
++			int py = (int)(y * 1920u / g_touch.yres);
++			g_touch.last_x[i] = (uint16_t)px;
++			g_touch.last_y[i] = (uint16_t)py;
++			sweet_hid_touch((int)i, 1, px, py);
++			(*events)++;
++		} else if (g_touch.down_mask & (1u << i)) {
++			sweet_hid_touch((int)i, 0, g_touch.last_x[i], g_touch.last_y[i]);
++			(*events)++;
++		}
++	}
++	g_touch.down_mask = pressed;
++	return 0;
+ }
+ 
+ static void
+ shamrock_touch_thread(void *arg, wait_result_t result)
+ {
++	static const uint32_t blk[] = { 4, 16, 32, 0 };
++	uint32_t polls = 0, ok = 0, bad = 0, events = 0;
++	int err, last = 0;
++
+ 	(void)arg;
+ 	(void)result;
+ 
+-	printf("SHAMROCK TOUCH: thread started\n");
++	uint32_t iomode = touch_rd(g_touch.qup, QUP_IO_MODE);
++	g_touch.out_fifo = blk[iomode & 3u] * (2u << ((iomode >> 2) & 7u));
++	g_touch.in_fifo = blk[(iomode >> 5) & 3u] * (2u << ((iomode >> 7) & 7u));
++	printf("SHAMROCK TOUCH: QUP io_mode %#x: out fifo %u, in fifo %u bytes; clk_ctl %#x\n",
++	    iomode, g_touch.out_fifo, g_touch.in_fifo, QUP_CLK_CTL_400K);
+ 
+-	/* Probe Goodix Chip ID at 0x8140 */
+-	uint8_t id_buf[4] = {0};
+-	int err = goodix_read_reg(GOODIX_REG_ID, id_buf, 4);
+-	if (err == 0) {
+-		printf("SHAMROCK TOUCH: Goodix ID: '%c%c%c%c' (0x%02x 0x%02x 0x%02x 0x%02x)\n",
+-		    id_buf[0], id_buf[1], id_buf[2], id_buf[3],
+-		    id_buf[0], id_buf[1], id_buf[2], id_buf[3]);
+-		g_touch.detected = true;
++	err = hx_probe();
++	printf("SHAMROCK TOUCH: HX852x at 0x48 -> %d (0 = answered) i2c %#x err %#x; gpio91 %#x/%#x gpio64 %#x/%#x gpio65 %#x/%#x\n",
++	    err, g_touch.last_i2c, g_touch.last_err,
++	    touch_rd(g_touch.tlmm, TLMM_CFG(GPIO_TS_POWER)), touch_rd(g_touch.tlmm, TLMM_IO(GPIO_TS_POWER)),
++	    touch_rd(g_touch.tlmm, TLMM_CFG(GPIO_TS_RESET)), touch_rd(g_touch.tlmm, TLMM_IO(GPIO_TS_RESET)),
++	    touch_rd(g_touch.tlmm, TLMM_CFG(GPIO_TS_IRQ)), touch_rd(g_touch.tlmm, TLMM_IO(GPIO_TS_IRQ)));
++	if (err != 0) {
++		/* which address does answer, if any (the other units' controllers) */
++		static const uint8_t addrs[] = { 0x5d, 0x14, 0x20, 0x48 };
++		uint8_t one;
++		for (unsigned i = 0; i < sizeof(addrs); i++) {
++			printf("SHAMROCK TOUCH: probe %#x -> %d\n", addrs[i], qup_xfer(addrs[i], true, &one, 1));
++		}
+ 	} else {
+-		printf("SHAMROCK TOUCH: probe 0x8140 returned %d\n", err);
++		hx_config();
+ 	}
+ 
+-	/*
+-	 * shamrock: which controller answers? The DT lists Synaptics (0x20), Himax (0x48) and Goodix
+-	 * (0x5d, or 0x14 after a reset with INT high). A one-byte read gets an ACK or a NACK (EIO).
+-	 */
+-	static const uint8_t probe_addr[] = { 0x5d, 0x14, 0x20, 0x48 };
+-	int probe_err[4];
+-	for (int i = 0; i < 4; i++) {
+-		uint8_t one = 0;
+-		probe_err[i] = qup_i2c_read(probe_addr[i], &one, 1);
+-	}
+-	printf("SHAMROCK TOUCH: probe 0x5d=%d 0x14=%d 0x20=%d 0x48=%d (0 = answered)\n",
+-	    probe_err[0], probe_err[1], probe_err[2], probe_err[3]);
+-
+-	uint32_t poll_count = 0, reads_ok = 0, reads_bad = 0, ready = 0;
+-	int last_err = 0;
+-	int test_touch = 0;
+-	PE_parse_boot_argn("sweettouch_test", &test_touch, sizeof(test_touch));
+-
+ 	for (;;) {
+-		touch_sleep_ms(10); /* 100 Hz polling */
+-		poll_count++;
+-
+-		/* Synthetic touch test if requested via boot-arg */
+-		if (test_touch && (poll_count % 300 == 0)) {
+-			/* Simulate an unlock swipe upwards: from (540, 1600) to (540, 600) */
+-			printf("SHAMROCK TOUCH: simulated swipe\n");
+-			for (int step = 0; step <= 10; step++) {
+-				int sy = 1600 - step * 100;
+-				sweet_hid_touch(0, 1, 540, sy);
+-				delay(10000);
+-			}
+-			sweet_hid_touch(0, 0, 540, 600);
+-			continue;
+-		}
+-
+-		/* Read Goodix Touch Coordinates from 0x814E */
+-		uint8_t report[1 + 8]; /* 1 status byte + contact 0 */
+-		err = goodix_read_reg(GOODIX_READ_COOR, report, sizeof(report));
++		touch_sleep_ms(err ? 1000 : 8);
++		polls++;
+ 		if (err == 0) {
+-			reads_ok++;
+-		} else {
+-			reads_bad++;
+-			last_err = err;
+-		}
+-		if ((poll_count % 1000) == 0) {
+-			/* (a status line every ~10 s, so a stall dump taken late still shows it) */
+-			printf("SHAMROCK TOUCH: status detected=%d probe 0x5d=%d 0x14=%d 0x20=%d 0x48=%d reads ok=%u bad=%u last=%d ready=%u "
+-			    "qup state=%#x err=%#x i2c=%#x gpio64 cfg=%#x io=%#x gpio65 cfg=%#x io=%#x\n",
+-			    g_touch.detected, probe_err[0], probe_err[1], probe_err[2], probe_err[3], reads_ok, reads_bad, last_err, ready,
+-			    touch_rd(g_touch.qup, QUP_STATE), touch_rd(g_touch.qup, QUP_ERROR_FLAGS), touch_rd(g_touch.qup, QUP_I2C_STATUS),
+-			    touch_rd(g_touch.tlmm, TLMM_GPIO_CFG(64)), touch_rd(g_touch.tlmm, TLMM_GPIO_IN_OUT(64)),
+-			    touch_rd(g_touch.tlmm, TLMM_GPIO_CFG(65)), touch_rd(g_touch.tlmm, TLMM_GPIO_IN_OUT(65)));
+-		}
+-		if (err == 0) {
+-			uint8_t status = report[0];
+-			if (status & 0x80u) { /* Buffer ready */
+-				ready++;
+-				int count = status & 0x0fu;
+-				if (count > 0) {
+-					uint8_t *c = &report[1];
+-					int cid = c[0] & 0x0f;
+-					uint16_t x = (uint16_t)c[1] | ((uint16_t)c[2] << 8);
+-					uint16_t y = (uint16_t)c[3] | ((uint16_t)c[4] << 8);
+-					if (cid < 10) {
+-						g_touch.last_x[cid] = x;
+-						g_touch.last_y[cid] = y;
+-						sweet_hid_touch(cid, 1, (int)x, (int)y);
+-					}
+-					g_touch.last_contacts = count;
+-				} else if (g_touch.last_contacts > 0) {
+-					/* All fingers released */
+-					for (int i = 0; i < 10; i++) {
+-						sweet_hid_touch(i, 0, (int)g_touch.last_x[i], (int)g_touch.last_y[i]);
+-					}
+-					g_touch.last_contacts = 0;
+-				}
+-				/* Clear buffer status flag */
+-				goodix_write_u8(GOODIX_READ_COOR, 0);
++			int e = hx_poll(&events);
++			if (e) {
++				bad++;
++				last = e;
++			} else {
++				ok++;
+ 			}
+ 		}
++		if ((polls % (err ? 10u : 1200u)) == 0) {
++			printf("SHAMROCK TOUCH: status hx=%d polls ok=%u bad=%u last=%d events=%u i2c %#x err %#x irq-gpio %#x\n",
++			    err, ok, bad, last, events, g_touch.last_i2c, g_touch.last_err,
++			    touch_rd(g_touch.tlmm, TLMM_IO(GPIO_TS_IRQ)));
++		}
+ 	}
+-
+-	(void)thread_terminate(current_thread());
+-	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
+ void
+ sweet_touch_init(void)
+ {
+ 	thread_t thread;
++	int enabled = 1;
+ 
+ 	if (g_touch.started) {
+ 		return;
+ 	}
+ 	g_touch.started = true;
+-
+-	int enabled = 1;
+ 	PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+ 	if (!enabled) {
+ 		printf("SHAMROCK TOUCH: disabled (sweettouch=0)\n");
+ 		return;
+ 	}
+-
+ 	g_touch.qup = ml_io_map(SHAMROCK_QUP_PA, 0x1000);
+-	g_touch.gcc = ml_io_map(SHAMROCK_GCC_PA, 0x10000);
+-	g_touch.tlmm = ml_io_map(SHAMROCK_TLMM_PA, 0x50000);
+-
++	g_touch.gcc = ml_io_map(SHAMROCK_GCC_PA, 0x50000);
++	g_touch.tlmm = ml_io_map(SHAMROCK_TLMM_PA, 0x60000);
+ 	if (!g_touch.qup || !g_touch.gcc || !g_touch.tlmm) {
+-		printf("SHAMROCK TOUCH: MMIO mapping failed (qup=%p gcc=%p tlmm=%p)\n",
+-		    (void *)g_touch.qup, (void *)g_touch.gcc, (void *)g_touch.tlmm);
++		printf("SHAMROCK TOUCH: MMIO mapping failed\n");
+ 		return;
+ 	}
+-
+-	printf("SHAMROCK TOUCH: initializing QUP v2.4 I2C at %p\n", (void *)g_touch.qup);
+-	qup_init_bus();
++	/* clocks: BLSP1 AHB (vote), QUP3 I2C apps (root on: XO 19.2 MHz after reset; branch on) */
++	touch_wr(g_touch.gcc, GCC_APCS_VOTE, touch_rd(g_touch.gcc, GCC_APCS_VOTE) | (1u << 10));
++	touch_wr(g_touch.gcc, GCC_QUP3_I2C_RCGR, touch_rd(g_touch.gcc, GCC_QUP3_I2C_RCGR) | 2u);
++	touch_wr(g_touch.gcc, GCC_QUP3_I2C_CBCR, touch_rd(g_touch.gcc, GCC_QUP3_I2C_CBCR) | 1u);
++	for (int i = 0; i < 500 && (touch_rd(g_touch.gcc, GCC_QUP3_I2C_CBCR) & (1u << 31)); i++) {
++		delay(2);
++	}
++	/* pins: gpio10/11 to blsp_i2c3 (2 mA, no bias), irq gpio65 input with pull-up */
++	touch_wr(g_touch.tlmm, TLMM_CFG(GPIO_I2C_SDA), FUNC_BLSP_I2C3 << 2);
++	touch_wr(g_touch.tlmm, TLMM_CFG(GPIO_I2C_SCL), FUNC_BLSP_I2C3 << 2);
++	touch_wr(g_touch.tlmm, TLMM_CFG(GPIO_TS_IRQ), TLMM_PULL_UP);
++	printf("SHAMROCK TOUCH: QUP3 clock cbcr %#x, i2c pins %#x/%#x\n", touch_rd(g_touch.gcc, GCC_QUP3_I2C_CBCR),
++	    touch_rd(g_touch.tlmm, TLMM_CFG(GPIO_I2C_SDA)), touch_rd(g_touch.tlmm, TLMM_CFG(GPIO_I2C_SCL)));
+ 
+ 	kern_return_t kr = kernel_thread_start(shamrock_touch_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
