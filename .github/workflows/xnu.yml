@@ -55,6 +55,11 @@ jobs:
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="arm64" VALID_ARCHS="arm64" WARNING_CFLAGS="-mcpu=cortex-a53+nocrypto"/' dxb/build.sh
           grep -c 'VALID_ARCHS="arm64" WARNING_CFLAGS' dxb/build.sh
+          # the KDK download from GitHub releases sometimes returns an empty body on runners
+          # (twice on 2026-11-09: "hdiutil: attach failed - image not recognized"): retry until
+          # hdiutil recognises the image
+          sed -i '' 's|^\( *\)curl --progress-bar --max-time 900 --connect-timeout 60 -L -o /tmp/KDK.dmg "${KDK_URL}"|\1for kdk_try in 1 2 3 4 5 6; do curl --progress-bar --max-time 900 --connect-timeout 60 -L -o /tmp/KDK.dmg "${KDK_URL}" \&\& hdiutil imageinfo /tmp/KDK.dmg >/dev/null 2>\&1 \&\& break; echo "KDK download try $kdk_try failed, retrying"; sleep 60; done|' dxb/build.sh
+          grep -c 'KDK download try' dxb/build.sh
           ls dxb/patches
 
       - name: Deps
