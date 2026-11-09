@@ -1,0 +1,76 @@
+diff --git c/iokit/Kernel/arm/SweetFramebuffer.cpp i/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 8a167d6..6bc981e 100644
+--- c/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ i/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -39,7 +39,6 @@
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+-extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+ 
+ /*
+  * shamrock: double buffering. r53 (GPU, sysmem): the frame visibly painted itself from top to
+@@ -51,9 +50,10 @@ extern "C" vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+  * Same registers as the s1 shim's display switch. sweetfb_double=0: one buffer, as before.
+  */
+ #define SWEET_FB_BUF1_PHYS      0x90800000ULL
+-#define SWEET_MDP_PA            0x01a00000ULL   /* MDP base 0x01a01000: CTL0 at +0x2000, RGB0 at +0x15000 */
+-#define SWEET_MDP_CTL0_FLUSH    (0x2000 + 0x18)
+-#define SWEET_MDP_RGB0_SRC0     (0x15000 + 0x14)
++#define SWEET_MDP_CTL0_PA       0x01a02000ULL   /* MDP base 0x01a01000 + 0x1000 */
++#define SWEET_MDP_RGB0_PA       0x01a15000ULL   /* MDP base + 0x14000 */
++#define SWEET_MDP_CTL0_FLUSH    0x18
++#define SWEET_MDP_RGB0_SRC0     0x14
+ /* HakiosGPU.cpp: waits up to the given milliseconds for the GPU to finish drawing into the surface */
+ bool MiniIOSurfaceDrawn(SweetSurface *surface, uint64_t milliseconds);
+ 
+@@ -127,7 +127,9 @@ public:
+ 	uintptr_t     fBuf[2];          /* double buffering: kernel mappings of the two panel buffers */
+ 	uint64_t      fBufPhys[2];
+ 	uint32_t      fFront;           /* the one the MDP shows */
+-	volatile uint32_t *fMDP;        /* 0: one buffer */
++	volatile uint32_t *fMDP;        /* CTL0; NULL: one buffer */
++	volatile uint32_t *fRGB0;
++	IOMemoryMap  *fBuf1Map;
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+ 	IOLock       *fLock;            /* swaps and client list */
+@@ -239,15 +241,25 @@ AppleCLCD::start(IOService *provider)
+ 			fBuf[0] = fPixels;
+ 			fBufPhys[0] = fPhys;
+ 			fBufPhys[1] = SWEET_FB_BUF1_PHYS;
+-			fBuf[1] = ml_io_map_wcomb((vm_offset_t)SWEET_FB_BUF1_PHYS, bytes);
+-			fMDP = (volatile uint32_t *)ml_io_map((vm_offset_t)SWEET_MDP_PA, 0x20000);
+-			if (fBuf[1] == 0 || fMDP == NULL) {
++			/*
++			 * (r54 panicked here: ml_io_map_wcomb of 8 MB, then ml_io_map of 128 KB, ran the kernel's
++			 * small I/O map out of room. The buffer goes through an IOMemoryDescriptor into the kernel
++			 * map; the MDP gets two pages.)
++			 */
++			IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress)SWEET_FB_BUF1_PHYS, bytes,
++			    kIODirectionInOut);
++			fBuf1Map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
++			OSSafeReleaseNULL(md);
++			fBuf[1] = fBuf1Map != NULL ? (uintptr_t)fBuf1Map->getVirtualAddress() : 0;
++			fMDP = (volatile uint32_t *)ml_io_map((vm_offset_t)SWEET_MDP_CTL0_PA, 0x1000);
++			fRGB0 = (volatile uint32_t *)ml_io_map((vm_offset_t)SWEET_MDP_RGB0_PA, 0x1000);
++			if (fBuf[1] == 0 || fMDP == NULL || fRGB0 == NULL) {
+ 				fMDP = NULL;
+ 			} else {
+ 				memcpy((void *)fBuf[1], (const void *)fBuf[0], (size_t)fRowBytes * fHeight);
+ 				fFront = 0;
+ 				IOLog("SWEET FB: double buffering: %#llx and %#llx, RGB0 SRC0_ADDR %#x\n", fBufPhys[0], fBufPhys[1],
+-				    fMDP[SWEET_MDP_RGB0_SRC0 / 4]);
++				    fRGB0[SWEET_MDP_RGB0_SRC0 / 4]);
+ 			}
+ 		}
+ 	}
+@@ -601,7 +613,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 	}
+ 	if (fMDP != NULL && drew) {
+ 		__builtin_arm_dsb(0xf);
+-		fMDP[SWEET_MDP_RGB0_SRC0 / 4] = (uint32_t)fBufPhys[back];
++		fRGB0[SWEET_MDP_RGB0_SRC0 / 4] = (uint32_t)fBufPhys[back];
+ 		fMDP[SWEET_MDP_CTL0_FLUSH / 4] = fMDP[SWEET_MDP_CTL0_FLUSH / 4] | 0x8;
+ 		__builtin_arm_dsb(0xf);
+ 		fFront = back;
