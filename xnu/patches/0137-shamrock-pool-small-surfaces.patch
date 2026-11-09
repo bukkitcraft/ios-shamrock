@@ -1,0 +1,15 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 33e5d6f..0abd073 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -88,8 +88,8 @@ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+  * (IOCoreSurfaceRoot::start, boot-arg sweetsurfpool=<MB>, default 96, 0 = none) and every surface of
+  * SWEET_POOL_MIN bytes or more gets its pixels from it (first fit, coalescing free list).
+  */
+-#define SWEET_POOL_MIN          (512u << 10)
+-#define SWEET_POOL_BLOCKS       128
++#define SWEET_POOL_MIN          (64u << 10)      /* r44m: a 256 KB surface failed HakiosGPU contiguity */
++#define SWEET_POOL_BLOCKS       1024
+ struct sweet_pool_t {
+ 	IOBufferMemoryDescriptor *mem;
+ 	uint64_t bytes, phys;
