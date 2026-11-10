@@ -1,0 +1,129 @@
+diff --git c/osfmk/arm64/sweet_stall.c i/osfmk/arm64/sweet_stall.c
+index fa670bc..fbe73e1 100644
+--- c/osfmk/arm64/sweet_stall.c
++++ i/osfmk/arm64/sweet_stall.c
+@@ -18,6 +18,9 @@
+ #include <pexpert/pexpert.h>
+ #include <pexpert/arm64/board_config.h>
+ #include <sys/msgbuf.h>
++#include <kern/task.h>
++#include <string.h>
++#include <vm/vm_map.h>
+ 
+ #if defined(SWEET)
+ extern int printf(const char *fmt, ...) __printflike(1, 2);
+@@ -52,6 +55,93 @@ s_x(uint64_t v)
+ 	}
+ }
+ 
++/*
++ * shamrock: user stacks of the threads of a few processes ("P name" before each thread, "U pc lr"
++ * and "u lr" frames after it), read after the thread list is unlocked. Symbolize with the dyld
++ * shared cache of the root and the slide the GL library logs ("shared cache at ..., slide ...").
++ */
++extern vm_map_t get_task_map(task_t);
++extern char *proc_name_address(void *p);
++
++#define STALL_USER_MAX 64
++static struct {
++	task_t task;
++	uint64_t tid, pc, lr, fp, sp;
++} s_user[STALL_USER_MAX];
++static int s_nuser;
++
++static bool
++stall_user_wanted(const char *name)
++{
++	static const char *const want[] = { "SpringBoard", "backboardd", "containermanager", "com.apple.datami", "lsd", "installd" };
++	for (unsigned i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
++		if (strncmp(name, want[i], strlen(want[i])) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
++static void
++stall_user_note(thread_t th)
++{
++	task_t tk = get_threadtask(th);
++	void *bp = tk ? get_bsdtask_info(tk) : NULL;
++	const char *name = bp ? proc_name_address(bp) : NULL;
++	if (name == NULL) {
++		return;
++	}
++	s_s(" P ");
++	s_s(name);
++	s_c('\n');
++	if (s_nuser >= STALL_USER_MAX || th->machine.upcb == NULL || !stall_user_wanted(name) ||
++	    !is_saved_state64(th->machine.upcb)) {
++		return;
++	}
++	task_reference(tk);
++	s_user[s_nuser].task = tk;
++	s_user[s_nuser].tid = th->thread_id;
++	s_user[s_nuser].pc = get_saved_state_pc(th->machine.upcb);
++	s_user[s_nuser].lr = get_saved_state_lr(th->machine.upcb);
++	s_user[s_nuser].fp = get_saved_state_fp(th->machine.upcb);
++	s_user[s_nuser].sp = get_saved_state_sp(th->machine.upcb);
++	s_nuser++;
++}
++
++static void
++stall_user_stacks(void)
++{
++	s_s("USER\n");
++	for (int i = 0; i < s_nuser; i++) {
++		vm_map_t map = get_task_map(s_user[i].task);
++		uint64_t fp = s_user[i].fp;
++		s_s("UT ");
++		s_x(s_user[i].tid);
++		s_s(" U ");
++		s_x(s_user[i].pc);
++		s_c(' ');
++		s_x(s_user[i].lr);
++		s_s(" sp ");
++		s_x(s_user[i].sp);
++		s_c('\n');
++		for (int d = 0; map && d < 24 && fp && !(fp & 0xf); d++) {
++			uint64_t fr[2];
++			if (vm_map_read_user(map, (vm_map_address_t)fp, fr, sizeof(fr)) != KERN_SUCCESS) {
++				break;
++			}
++			s_s(" u ");
++			s_x(fr[1]);
++			s_c('\n');
++			if (fr[0] <= fp) {
++				break;
++			}
++			fp = fr[0];
++		}
++		task_deallocate(s_user[i].task);
++	}
++	s_nuser = 0;
++}
++
+ static void
+ sweet_stall_fire(thread_call_param_t p0, thread_call_param_t p1)
+ {
+@@ -84,6 +174,7 @@ sweet_stall_fire(thread_call_param_t p0, thread_call_param_t p1)
+ 		s_s(" wr=");
+ 		s_x((uint64_t)th->wait_result);
+ 		s_c('\n');
++		stall_user_note(th);
+ 		vm_offset_t kstack = th->kernel_stack;
+ 		if (kstack && th->machine.kstackptr) {
+ 			thread_kernel_state_t ks = (thread_kernel_state_t)th->machine.kstackptr;
+@@ -110,10 +201,11 @@ sweet_stall_fire(thread_call_param_t p0, thread_call_param_t p1)
+ 	if (locked) {
+ 		lck_mtx_unlock(&tasks_threads_lock);
+ 	}
++	stall_user_stacks();
+ 	/* tail of the kernel message buffer (printf/IOLog/hfs messages): msg_bufx is the write pointer of a ring */
+ 	if (msgbufp && msgbufp->msg_magic == MSG_MAGIC && msgbufp->msg_bufc && msgbufp->msg_size > 0) {
+ 		int size = msgbufp->msg_size;
+-		int n = size < 120000 ? size : 120000;
++		int n = size < 100000 ? size : 100000;
+ 		int x = msgbufp->msg_bufx;
+ 		s_s("MSGBUF\n");
+ 		for (int i = n; i > 0; i--) {
