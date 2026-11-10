@@ -1,0 +1,39 @@
+diff --git c/bsd/dev/shamrock_rpm.c i/bsd/dev/shamrock_rpm.c
+index 257d20d..373abcd 100644
+--- c/bsd/dev/shamrock_rpm.c
++++ i/bsd/dev/shamrock_rpm.c
+@@ -193,14 +193,18 @@ rpm_open(void)
+ 	return true;
+ }
+ 
++/*
++ * The FIFOs of a word-flag channel live in the RPM message RAM, which takes 32-bit accesses only
++ * (Linux: smd_copy_to_fifo() uses __iowrite32_copy when the channel info is word-sized). r71/r72
++ * wrote bytes: the RPM got a garbled packet and reset the SoC. len and head are multiples of 4.
++ */
+ static void
+-fifo_write(const void *data, uint32_t len)
++fifo_write(const uint32_t *data, uint32_t len)
+ {
+ 	uint32_t head = INFO_GET(tx_info, head);
+-	const uint8_t *p = (const uint8_t *)data;
+-	for (uint32_t i = 0; i < len; i++) {
+-		tx_fifo[head] = p[i];
+-		head = (head + 1) % fifo_size;
++	for (uint32_t i = 0; i < len / 4; i++) {
++		*(volatile uint32_t *)(tx_fifo + head) = data[i];
++		head = (head + 4) % fifo_size;
+ 	}
+ 	__builtin_arm_dmb(0xf);
+ 	INFO_SET(tx_info, head, head);
+@@ -254,8 +258,8 @@ rpm_request(uint32_t type, uint32_t id, const uint32_t *kv, uint32_t pairs)
+ 	}
+ 	uint32_t rt = INFO_GET(rx_info, tail), rh = INFO_GET(rx_info, head);
+ 	uint32_t word[8] = { 0 };
+-	for (uint32_t i = 0; i < 32 && ((rt + i) % fifo_size) != rh; i++) {
+-		((uint8_t *)word)[i] = rx_fifo[(rt + i) % fifo_size];
++	for (uint32_t i = 0; i < 8 && ((rt + 4 * i) % fifo_size) != rh; i++) {
++		word[i] = *(volatile uint32_t *)(rx_fifo + ((rt + 4 * i) % fifo_size));
+ 	}
+ 	INFO_SET(rx_info, tail, rh);
+ 	INFO_SET(tx_info, fTAIL, 1);
