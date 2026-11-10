@@ -1,0 +1,82 @@
+diff --git c/iokit/Kernel/arm/SweetFramebuffer.cpp i/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 43816a2..1b50429 100644
+--- c/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ i/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -96,6 +96,35 @@ sweet_flush_pending(volatile uint32_t *ctl)
+ }
+ /* HakiosGPU.cpp: waits up to the given milliseconds for the GPU to finish drawing into the surface */
+ bool MiniIOSurfaceDrawn(SweetSurface *surface, uint64_t milliseconds);
++extern "C" bool hakios_gpu_done(uint32_t fence);
++extern "C" bool hakios_gpu_ready(void);
++
++/*
++ * shamrock: the frame's (single) surface is still being drawn by the GPU. The display waits for the GPU
++ * itself (RedwoodWaitsForGPU: eagl no longer glFinish()es every frame, so backboardd prepares the next
++ * frame while the GPU draws this one); a tick whose frame is not drawn yet is skipped, nothing blocks.
++ */
++static bool
++sweet_frame_drawing(const uint8_t *rec)
++{
++	uint32_t mask, id = 0, layers = 0;
++	memcpy(&mask, rec + 0x104, 4);
++	for (uint32_t layer = 0; layer < 4; layer++) {
++		uint32_t lid;
++		memcpy(&lid, rec + 0x54 + 4 * layer, 4);
++		if ((mask & (1u << layer)) && lid != 0) {
++			layers++;
++			id = lid;
++		}
++	}
++	if (layers != 1 || !hakios_gpu_ready()) {
++		return false;
++	}
++	SweetSurface *s = sweet_surface_copy(id);
++	bool drawing = s != NULL && s->drawn != 0 && !hakios_gpu_done(s->drawn);
++	OSSafeReleaseNULL(s);
++	return drawing;
++}
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -178,6 +207,8 @@ public:
+ 	uint32_t      fVigFrames, fCpuFrames, fFlipBusy;
+ 	uint32_t      fBusyRun, fBusyForced;  /* shamrock: ticks in a row with a flip pending; flips pushed through anyway */
+ 	uint64_t      fStatSwaps, fStatTicks; /* 5 s status line */
++	bool          fGpuWaits;              /* RedwoodWaitsForGPU published (boot-arg sweetfb_gpuwait=0: not) */
++	uint32_t      fGpuNotDone, fGpuRun;   /* ticks skipped: the frame was still being drawn (in all, in a row) */
+ 	uint32_t      fNotVig[5];       /* why not VIG0: layers, surface kind/size/format, memory not contiguous, other */
+ 	uint32_t      fNotVigLayers, fNotVigW, fNotVigH, fNotVigFmt;  /* the last one seen */
+ 	bool presentMDP(const uint8_t *rec);
+@@ -338,6 +369,12 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	{
++		uint32_t gw = 1;
++		PE_parse_boot_argn("sweetfb_gpuwait", &gw, sizeof(gw));
++		fGpuWaits = gw != 0 && fMDP != NULL;
++		setProperty("RedwoodWaitsForGPU", fGpuWaits);   /* eagl: no glFinish() per frame (display_waits()) */
++	}
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+@@ -411,10 +448,17 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	} else if (flush) {
+ 		fb->fBusyRun = 0;
+ 	}
++	if (flush && fb->fGpuWaits && fb->fGpuRun < 30 && sweet_frame_drawing(fb->fPending)) {
++		flush = false;
++		fb->fGpuNotDone++;
++		fb->fGpuRun++;                  /* (half a second: presentMDP() waits for it then, as before) */
++	} else if (flush) {
++		fb->fGpuRun = 0;
++	}
+ 	if ((++fb->fStatTicks % (5000000 / SWEET_FB_VSYNC_US)) == 0) {
+-		IOLog("SWEET FB: 5 s: %llu swaps in all, %u VIG0 / %u CPU frames, %u ticks skipped (longest run %u), flush %#x, "
++		IOLog("SWEET FB: 5 s: %llu swaps in all, %u VIG0 / %u CPU frames, %u ticks skipped (longest run %u), %u GPU not done, flush %#x, "
+ 		    "layer0 %#x, dirty %d, off %d, vig %d\n", fb->fStatSwaps, fb->fVigFrames, fb->fCpuFrames, fb->fFlipBusy,
+-		    fb->fBusyForced, fb->fMDP ? fb->fMDP[SWEET_MDP_CTL0_FLUSH / 4] : 0, fb->fMDP ? fb->fMDP[SWEET_MDP_LAYER0 / 4] : 0,
++		    fb->fBusyForced, fb->fGpuNotDone, fb->fMDP ? fb->fMDP[SWEET_MDP_CTL0_FLUSH / 4] : 0, fb->fMDP ? fb->fMDP[SWEET_MDP_LAYER0 / 4] : 0,
+ 		    fb->fDirty, fb->fPowerOff, fb->fVigOn);
+ 	}
+ 	uint8_t *rec = NULL;
