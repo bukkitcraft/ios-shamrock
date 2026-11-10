@@ -1,0 +1,13 @@
+diff --git c/bsd/dev/shamrock_rpm.c i/bsd/dev/shamrock_rpm.c
+index 021ac2a..06759b4 100644
+--- c/bsd/dev/shamrock_rpm.c
++++ i/bsd/dev/shamrock_rpm.c
+@@ -21,6 +21,8 @@
+ #include <machine/machine_routines.h>
+ #include <string.h>
+ 
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
+ #define SMEM_PA                 0x86300000ULL
+ #define SMEM_SIZE               0x100000
+ #define RPM_IPC_PA              0x0b011008ULL           /* APCS IPC; bit 0: RPM */
