@@ -1,0 +1,93 @@
+diff --git c/bsd/dev/shamrock_rpm.c i/bsd/dev/shamrock_rpm.c
+index 133e2da..c0594c6 100644
+--- c/bsd/dev/shamrock_rpm.c
++++ i/bsd/dev/shamrock_rpm.c
+@@ -55,6 +55,8 @@ static volatile uint8_t *tx_fifo, *rx_fifo;
+ static uint32_t fifo_size, msg_id;
+ 
+ extern void sweet_mem_bench_print(const char *when);
++extern void sweet_live_snapshot(void);
++#define STEP(...) do { printf(__VA_ARGS__); sweet_live_snapshot(); } while (0)
+ 
+ static volatile void *
+ smem_item(uint32_t item, uint32_t *size)
+@@ -163,6 +165,7 @@ rpm_open(void)
+ 		return true;
+ 	}
+ 	/* qcom_smd_channel_reset + open: our head and the remote's tail to 0, then OPENING */
++	STEP("SHAMROCK RPM: open: tx %u rx %u -> CLOSED\n", INFO_GET(tx_info, state), INFO_GET(rx_info, state));
+ 	INFO_SET(tx_info, state, SMD_CLOSED);
+ 	INFO_SET(tx_info, fDSR, 0);
+ 	INFO_SET(tx_info, fCTS, 0);
+@@ -174,6 +177,7 @@ rpm_open(void)
+ 	INFO_SET(tx_info, fDSR, 1);
+ 	INFO_SET(tx_info, fCTS, 1);
+ 	INFO_SET(tx_info, fCD, 1);
++	STEP("SHAMROCK RPM: open: closed, rx %u; -> OPENING\n", INFO_GET(rx_info, state));
+ 	INFO_SET(tx_info, state, SMD_OPENING);
+ 	INFO_SET(tx_info, fSTATE, 1);
+ 	rpm_kick();
+@@ -181,9 +185,11 @@ rpm_open(void)
+ 		printf("SHAMROCK RPM: remote did not open (rx state %u)\n", INFO_GET(rx_info, state));
+ 		return false;
+ 	}
++	STEP("SHAMROCK RPM: open: rx OPENED; -> OPENED\n");
+ 	INFO_SET(tx_info, state, SMD_OPENED);
+ 	INFO_SET(tx_info, fSTATE, 1);
+ 	rpm_kick();
++	STEP("SHAMROCK RPM: open: done, tx %u rx %u\n", INFO_GET(tx_info, state), INFO_GET(rx_info, state));
+ 	return true;
+ }
+ 
+@@ -232,6 +238,7 @@ rpm_request(uint32_t type, uint32_t id, const uint32_t *kv, uint32_t pairs)
+ 		return false;
+ 	}
+ 	uint32_t rx_head0 = INFO_GET(rx_info, head);
++	STEP("SHAMROCK RPM: request %u: %u bytes, tx head %u tail %u\n", msg_id, len, head, tail);
+ 	fifo_write(pkt, len);
+ 	INFO_SET(tx_info, fHEAD, 1);
+ 	rpm_kick();
+@@ -279,6 +286,7 @@ shamrock_rpm_init(void)
+ 	volatile uint32_t *hdr = (volatile uint32_t *)smem;
+ 	printf("SHAMROCK RPM: SMEM initialized %u available %u free %#x version[7] %#x\n", hdr[0xc0 / 4], hdr[0xc4 / 4],
+ 	    hdr[0xc8 / 4], hdr[0x40 / 4 + 7]);
++	sweet_live_snapshot();
+ 	if (!rpm_find() || mode < 2) {
+ 		return;
+ 	}
+diff --git c/osfmk/arm64/sweet_stall.c i/osfmk/arm64/sweet_stall.c
+index 8cd77fa..9af87d1 100644
+--- c/osfmk/arm64/sweet_stall.c
++++ i/osfmk/arm64/sweet_stall.c
+@@ -231,6 +231,31 @@ sweet_live_fire(thread_call_param_t p0, thread_call_param_t p1)
+ 	thread_call_enter_delayed(s_live_call, deadline);
+ }
+ 
++/* shamrock: write the live log now (callers that may not survive the next step, e.g. the RPM client) */
++void sweet_live_snapshot(void);
++void
++sweet_live_snapshot(void)
++{
++	if (s_fired) {
++		return;
++	}
++	if (!s_live_va) {
++		s_live_va = ml_io_map(STALL_PA, STALL_SIZE);
++		if (!s_live_va) {
++			return;
++		}
++	}
++	s_region_take();
++	sbuf = (char *)s_live_va;
++	spos = 0;
++	s_s("LIVE (snapshot) now=");
++	s_x(mach_absolute_time());
++	s_c('\n');
++	s_msgbuf_tail(96 * 1024);
++	s_finish();
++	s_region_give();
++}
++
+ static void
+ sweet_stall_fire(thread_call_param_t p0, thread_call_param_t p1)
+ {
