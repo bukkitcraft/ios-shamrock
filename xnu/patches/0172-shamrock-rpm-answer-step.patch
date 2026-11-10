@@ -1,0 +1,20 @@
+diff --git c/bsd/dev/shamrock_rpm.c i/bsd/dev/shamrock_rpm.c
+index c0594c6..257d20d 100644
+--- c/bsd/dev/shamrock_rpm.c
++++ i/bsd/dev/shamrock_rpm.c
+@@ -260,7 +260,7 @@ rpm_request(uint32_t type, uint32_t id, const uint32_t *kv, uint32_t pairs)
+ 	INFO_SET(rx_info, tail, rh);
+ 	INFO_SET(tx_info, fTAIL, 1);
+ 	rpm_kick();
+-	printf("SHAMROCK RPM: request %u (type %#x id %u): answer %08x %08x %08x %08x %08x %08x %08x %08x\n", msg_id,
++	STEP("SHAMROCK RPM: request %u (type %#x id %u): answer %08x %08x %08x %08x %08x %08x %08x %08x\n", msg_id,
+ 	    type, id, word[0], word[1], word[2], word[3], word[4], word[5], word[6], word[7]);
+ 	return true;
+ }
+@@ -296,5 +296,6 @@ shamrock_rpm_init(void)
+ 	uint32_t kv[2] = { 0x007A484B, bimc };          /* "KHz" */
+ 	if (rpm_request(0x326b6c63, 0, kv, 1)) {        /* 'clk2' BIMC */
+ 		sweet_mem_bench_print("after the BIMC vote");
++		STEP("SHAMROCK RPM: BIMC %u kHz voted, still running\n", bimc);
+ 	}
+ }
