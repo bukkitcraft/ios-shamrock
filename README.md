@@ -1,203 +1,236 @@
-# ios-sweet
+# ios-shamrock — iOS on GM 5 Plus (MSM8952), native, no virtualization
 
-**Apple's iOS 16 running on a Redmi Note 10 Pro.**
+Goal (step 1): get an iOS (XNU) screen up on the phone's framebuffer. Nothing flashed; `fastboot boot` only
+(lk2nd stays; never write the boot partition).
 
-This project ports Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation) to the Xiaomi Redmi Note 10 Pro (`sweet`, Qualcomm SM7150 / Snapdragon 732G). On top of it runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd, SpringBoard and the stock apps.
+## Layout
+- ref/ios-sweet          — dipa-studio/ios-sweet (SM7150): boot shim (shim/), ADT generator (tools/mkadt.py), XNU patches (xnu/patches). Closest model for us.
+- ref/hackios-xnu-kernel — oosexgang/hackios-xnu-kernel (UEFI + loader approach, docs/porting)
+- notes/                 — findings
+- work/                  — our shim / device tree / images
 
-As of **2026-10-18** the phone boots to the **iOS home screen**. You can unlock it, open Settings, pull down Control Center and the notification center, and use the touchscreen and the hardware buttons. Rendering runs entirely on the CPU; there is no GPU driver.
+## Research findings (2026-11-05)
+Known approach (hackiosx.dev): build XNU xnu-8796 (iOS 16), small boot shim gets control from the bootloader,
+sets up MMU/memory, converts the phone DTB to an Apple Device Tree (ADT), jumps into XNU. Display = reuse the
+bootloader's framebuffer (no display driver; kernel draws the console into it, CoreAnimation software-renders).
+iPhone X (A11, no pointer auth) firmware is what these ports pretend to be.
 
-> Experimental bring-up, not a usable phone OS. Many things are missing or stubbed (see below), and Apple's security model is mostly switched off. It installs into the `userdata` partition and so **erases Android's user data**.
+### Blockers for MSM8952 (Cortex-A53 x8, GICv2/qgic2, eMMC, Adreno 405)
+1. **16K granule**: ios-sweet runs XNU with 16K pages (A55/A76 support it). Cortex-A53 TRM: only 4K/64K
+   (TGran16 = not supported). Real iOS arm64 XNU is built for 16K -> needs a 4K-page XNU port (big, unproven)
+   or at least for stage 1 (framebuffer/console only) a 4K-mode kernel bring-up. MUST verify on device:
+   read ID_AA64MMFR0_EL1 from a shim (ios-sweet NOTES.md line ~375 shows how it did it).
+2. **GICv2** (ios-sweet uses GICv3 in pe_fiq.c) -> XNU interrupt code needs a GICv2 driver.
+3. **eMMC/SDHCI** instead of UFS (hackiosx compat page: "eMMC requires new drivers"). Not needed for framebuffer stage if payload comes via ramdisk.
+4. RAM 3 GB (hackiosx min 2 GB, ok for stage 1).
+5. lk2nd + Android boot image: shim can be loaded as `fastboot boot` image, like ios-sweet.
 
-## What works
+### Staged plan
+- S0: shim-only bring-up: boot image with our own aarch64 stub (no XNU) -> read ID regs, find lk2nd/simplefb
+  framebuffer (from DTB `/chosen/framebuffer` or stock `fb` address), draw test pattern. Proves boot path + fb.
+- S1: shim + kernel console in that framebuffer (XNU-less "hello" with ADT parsing).
+- S2: XNU with 4K-page patch set, ramdisk root, GICv2, timers (arch timer is standard), PSCI SMP.
+- Parallel: hackios QEMU target (`make qemu-open`) only as a *debug aid* for XNU patches, not the goal.
 
-| Area | State |
-| --- | --- |
-| Boot | Stock Xiaomi bootloader → `fastboot boot` of our shim → XNU. Nothing is flashed to the boot partitions |
-| CPU | 6 of the 8 cores (the six Cortex-A55s) via PSCI, 16K pages, GICv3 interrupts, timers |
-| Memory | About 3.95 GiB of the upper DDR bank |
-| Storage | Own UFS host driver; the iOS root is a journaled HFS+ volume in `userdata`, read/write |
-| iOS userland | Real iPhone X 16.7.16 root filesystem and shared cache; launchd and the system daemons run |
-| Display | Kernel IOSurface + IOMobileFramebuffer (`AppleCLCD`) services; CoreAnimation renders in software; frames are copied into the bootloader's framebuffer. Presented to iOS as an iPhone X panel (1125×2436) |
-| GUI | backboardd, SpringBoard, lock screen, home screen, Control Center, notification center, Settings |
-| Touch | Goodix GT9896 over I²C (GENI), rail enabled through RPMh, delivered as HID digitizer events |
-| Buttons | Power, volume up/down (PMIC through SPMI) as HID consumer keys; lock/wake works |
-| Battery | IOPMPowerSource service (static 100 %, charging icon; real fuel-gauge readout prepared) |
-| Device identity | iPhone X (`iPhone10,3` / `D22AP`): no Home button, gesture UI |
-| Activation | Native "Hactivation" path of mobileactivationd, chosen through device-tree security status. No Apple servers involved |
+## Status
+Only research + folder + references so far. No code yet.
 
-## What does not work (yet)
+## Decision (2026-11-05): stay on iOS 16 (xnu-8796, iPhone X firmware), 4K-page port
+Older iOS rejected: arm64 XNU source is public only from ~iOS 11; 32-bit iOS needs AArch32 EL1 (impossible under TZ/lk2nd).
+Stock Android kernel is 32-bit (arch/arm dts), but our mainline port boots arm64 via lk2nd, so AArch64 EL1 is available.
 
-- **Navigation:** you cannot leave an app (the home gesture and AssistiveTouch Home do nothing yet).
-- **No Wi-Fi, Bluetooth, cellular, audio, camera, sensors, GPS or SEP / Face ID.** Daemons for them start and fail or keep relaunching.
-- **No GPU.** Everything is drawn by the CPU at roughly 20–30 fps. The two Cortex-A76 cores are not used yet.
-- **Few apps.** The image has only what is on the system volume. There is no App Store, no Apple ID, and some Settings pages are empty.
-- **Slow boot:** about 4 minutes on the Apple logo.
-- **Security is off:** permissive code signing (AMFI) and sandbox policies, a stub AppleKeyStore, no data protection. Do not put anything personal on it.
+## Boot facts from the working boot image (omarchy-shamrock/out/boot-omarchy.img)
+Android boot header v0, page_size 2048, kernel_addr 0x80008000, ramdisk_addr 0x81000000, tags 0x80000100,
+kernel = arm64 Image(.gz) with DTB appended. Test with `fastboot boot` only (lk2nd fastboot = USB 18d1:d00d). Never `fastboot flash boot`.
 
-## How it boots
+## Next
+- S0: shim (aarch64, Image header) -> read ID_AA64MMFR0_EL1/MIDR/CurrentEL, locate fb from lk2nd DTB, draw pattern.
+  Needs phone in lk2nd fastboot to read /chosen framebuffer address (or take from running Linux: /sys/class/graphics/fb0 / kmsgrab).
+- 4K experiment: build xnu-8796 with 4K pages, boot in QEMU as a debug aid (no phone).
 
-```
-ABL (stock Xiaomi bootloader, unlocked)
-  -> fastboot boot shim-boot.img              (temporary; nothing is flashed to boot)
-     -> shim: own MMU setup, reads the live FDT, loads the payload from the ramdisk
-        -> XNU Mach-O + generated Apple Device Tree (ADT) + boot-args
-           -> XNU -> UFS driver -> HFS+ root in the userdata partition
-              -> dyld + shared cache -> launchd -> daemons -> backboardd + SpringBoard
-```
+## Progress log
+- S0 shim built: work/s0 (./build.sh -> out/s0-boot.img). NOT yet tested on device (phone uncharged). Test: `fastboot boot work/s0/out/s0-boot.img`,
+  expect colour bars + CPU facts (TGran16 should be 0 on A53). Framebuffer 0x83200000 1080x1920 r8g8b8 (from kernel-port DTS).
+- IPSW iPhone10,3 16.7.16 downloading to ipsw/ (sha1 5606c298c1d908f8a48f617f0ceaf71f2a9f0193).
+- xnu-8796 + 79 ios-sweet patches apply cleanly (work/xnu-tree; 2 HFS patches need CI staging script). Patches for us: work/patches/.
+- KEY: XNU already has a Cortex-A53/ARMv8.0/4K config (BCM2837 = Raspberry Pi 3) -> template for 4K (needs __ARM64_PMAP_SUBPAGE_L1__, no __ARM_16K_PG__, no PAN, -march=armv8-a).
+- Still GICv3 in SWEET.h; MSM8952 has GICv2 (qgic2) -> needs driver (patch series 0101+).
+- GitHub fork (public) was DENIED by the auto-mode classifier on 2026-11-05 — nothing was pushed. XNU build needs macOS (CI). Decision for user: allow public fork, or private repo (macOS minutes cost 10x), or none.
+- notes/GICV2-PORT.md: GICv2 touch points + timer INTID 20.
+- IPSW verified (sha1 OK). Root images (BuildManifest d22ap): OS=087-86698-044.dmg (APFS, sealed; 4.7GB), Cryptex1,SystemOS=087-86593-047.dmg (2.7GB, dyld shared cache), Cryptex1,AppOS=087-86715-047.dmg. ios-sweet tools/mkiosroot.sh turns them into an HFS+ root; needs apfs-fuse + hfsprogs (AUR) .
+- System: root fs 99% full; `pacman -Su` runs with --cachedir /mnt/storage/pacman-cache --ignore linux-cachyos-headers (pahole dep unresolved).
+- HOST PACMAN: `pacman -Sy` was run (db synced) but the upgrade did NOT happen: Omarchy's pre-transaction hook (00-omarchy-update-guard) blocks direct `pacman -Su`; I did not bypass it (OMARCHY_ALLOW_DIRECT_PACMAN). Host is in "db newer than installed" state: do NOT `pacman -S <pkg>` on the host; run `omarchy update` (516 pkgs; root fs is 99% full, 1.9G free; linux-cachyos-headers needs pahole>=1.32-2).
+- Tools instead run in docker image `ios-shamrock-tools` (work/docker/Dockerfile): qemu-system-aarch64, p7zip, fuse3, base-devel.
+- S0 VERIFIED IN QEMU (not on phone): docker `ios-shamrock-tools`, `qemu-system-aarch64 -M virt -cpu cortex-a53 -m 3G -kernel work/s0/out/Image`, fb dumped with monitor `pmemsave 0x83200000 6220800` -> work/s0/qemu/fb.png.
+  Result: MIDR 410fd034 (A53 r0p4), TGran16=0 (16K unsupported), TGran4=0, TGran64=0, EL1, DTB passed. QEMU's A53 model has crypto (ISAR0 0x11120); real MSM8952 may not.
+- FORK CREATED (user-authorized 2026-11-05): https://github.com/bukkitcraft/ios-shamrock (public, MIT code only), branch `shamrock` = ios-sweet + xnu/patches/0100 (A53/4K). Local clone: work/repo. Actions enabled via API. First build: run 41965153565 (workflow xnu, macos-14).
+- CI BUILD OK (run 41965937406, ~7 min): xnu-8796 + ios-sweet + 0100 (A53/4K/ARMv8.0) + 0101 (4K MACH_VM_MAX_ADDRESS) compiles and links -> work/xnu-out/kernel.development.sweet (17MB Mach-O arm64). First failure was only pmap.c static_assert (macOS-platform 47-bit VA vs 4K L1=1GB).
+  NOT yet booted. Still GICv3 code paths (compile only). Next: 4K shim MMU (shim/mmu.c is 16K), mkpayload/mkadt for QEMU virt (-cpu cortex-a53, gic-version=2), GICv2 driver (notes/GICV2-PORT.md).
+- Userdata decision: nothing on the phone is erased for S0..S2 (RAM boot). For the iOS root later: use free tail of userdata (omarchy root ~11.8GB of 24.8GB) after backing up MBR; verify partition table first.
+- QEMU BOOT PROGRESS (cortex-a53, 4K): harness `work/qtest.sh <ci-run-id> <name> [secs]` (downloads kernel from CI, builds ADT+payload in docker, boots, writes work/q-<name>/out/fb.png + qemu.head).
+  r1 (0100+0101): prefetch abort at _arm_init (kernel VA -2TB large-memory layout not covered by 4K TTBR1)  -> fixed by 0102 (no ARM_LARGE_MEMORY for SWEET).
+  r2 (0102): data abort in sweet_early_mark: early fb only 2MB mapped (16K code assumed one 32MB block) -> 0103 (SWEET_EARLY_FB_BLOCKS loops in start.s + arm_vm_init.c).
+  r4 (0103): arm_init stages 1-4 OK (MMU on, console on screen), then panic: undefined instruction LDADD (LSE atomics, ARMv8.1) in lck_grp_reference -> Apple clang default CPU leaks LSE despite -march=armv8-a -> 0104 `-mcpu=cortex-a53+nocrypto`.
+  Patches: work/patches/0100..0104, repo bukkitcraft/ios-shamrock branch shamrock.
+- PHONE TEST 2026-11-05 (device serial 7bedada, stock aboot fastboot 18d1:d00d, NOT lk2nd): `fastboot boot s0-boot.img` -> "dtb not found" (stock aboot needs lk2nd in front). `fastboot boot lk2nd-msm8952.img` (md5 44688c98, RAM only, nothing written) -> sent OK, then "Status read failed", device re-enumerated as 05c6:900e QHSUSB__BULK (Qualcomm crash/download mode). Needs manual power-off (hold power 10-15 s), then re-enter fastboot. Notes in kernel-port/notes/SHAMROCK_NOTES.md (~l.388-453) say this worked before on the 2nd device; investigate before retrying.
+- S0 ON REAL PHONE WORKS (2026-11-05, GM5 Plus serial 7bedada): lk2nd 23.1 booted from RAM via `fastboot boot lk2nd-msm8952.img` ONLY after the stock aboot fastboot (18d1:d00d, "dtb not found" for any raw image) -> user put phone into lk2nd himself. Then `fastboot boot work/s0/out/s0-boot.img` OK; user reports the screen is correct (bars, text, corner squares): framebuffer 0x83200000 1080x1920 r8g8b8 BGR verified. IMPORTANT image format: kernel MUST be gzip(Image)+DTB appended (Image.gz-dtb) — raw Image + DTB gives "dtb not found". Register values still to be read from the screen.
+  Earlier crash: `fastboot boot lk2nd` from stock fastboot dropped the phone into 05c6:900e (QHSUSB__BULK crash/dl mode); only manual power-cycle recovers. Rule: never fastboot boot anything while the phone is not confirmed in lk2nd (getvar product=lk2nd-msm8952).
+- REAL MSM8952 VALUES (S0 photo, 2026-11-05): EL=1, MIDR=410fd034 (Cortex-A53 r0p4), MPIDR=80000100 (boot CPU = cluster1 core0, cpu@100), MMFR0=1122 (PARange 40-bit; TGran4=0, TGran16=0 => 16K NOT supported, TGran64=0), PFR0=2222 (GIC sysreg field=0 => GICv2; EL0-3 all AArch32-capable), ISAR0=11120 (AES+PMULL, SHA1, SHA2, CRC32 PRESENT => __ARM_V8_CRYPTO_EXTENSIONS__ may be re-enabled), CNTFRQ=19.2MHz, SCTLR=c00800 (MMU/caches off), DTB at 0x23400000. Screen output correct.
+- XNU in QEMU runs 16KB *software* pages on 4K hardware (PAGE_RATIO 4; arm_init chooses 16K when RAM > 1GB) => iPhone X userland keeps seeing 16K pages. Fixed PFZ commpage leaf index alignment (0108).
+- S0 now also writes its values into the ramoops console zone (0xdffd0000, sig DBGC) and PSCI-resets after 10 s; goal: `fastboot oem ramoops console` + `get_staged` retrieval. Not yet verified on phone.
+- CI blocked by bearssl.org 502 (pinned SHA fetch); polling in background; patches 0100-0108 pushed to bukkitcraft/ios-shamrock.
+- QEMU MILESTONE (CI run 41982352819, patches 0100-0108, cortex-a53, 4K HW / 16K SW pages): kernel boots through MMU, VM, zones, IOKit, BSD init and panics only at `IOFindBSDRoot: md0 has not been configured` = expected, the test payload has no ramdisk/root. Next in QEMU: provide a root (ios-sweet: `mkpayload.py --ramdisk` + tools/sweet-init.S via mkinit.py, then real HFS+ root from IPSW: needs hfsprogs/apfs-fuse (AUR, build in docker)).
+- Phone: S0 + PSCI reset returns to STOCK boot (lk2nd is not in boot partition) -> ramoops retrieval needs persistent lk2nd (boot partition write: user decision) or photos of the screen.
+- PHONE STATE (2026-11-05 ~10:15): lk2nd (first 512K of boot, md5 9df484bf of the padded part) is persistent in boot; the Omarchy boot image at +512K was ERASED by the user's request (backup: backup/cur-boot-part.bin, restore: `fastboot flash boot /mnt/storage/omarchy-shamrock/out/boot-omarchy.img`; userdata/rootfs untouched). Phone now stays in lk2nd fastboot after any reset => good for test loops. lk2nd view: partition `lk2nd` = first 0x80000, `boot` = rest (0x3f80000).
+- S0 + APSS watchdog (0x0b017000, bark 1s/bite 2s) resets the phone back to lk2nd fastboot in ~20 s: WORKS.
+- lk2nd 23.1 oem commands: ramoops raw/regions/console/dump, debug readb/readl/readq/writeb/writel/..., debug readpmic/writepmic/cpuid/spmi-regulators, dtb, screenshot, log, reboot-edl, hash, read-partition, parsed-tags/cmdline. lk2nd's ramoops region is at 0xbff80000 (NOT the 0xdffc0000 in our DTS), 0x2000-sized DUMP zones.
+- DANGER: `fastboot oem ramoops regions` (huge garbage output) and `oem ramoops dmesg` (nonexistent) HANG lk2nd -> needs a hard power-cycle. Use only small commands; always wrap in `timeout`. Prefer `oem debug readl <addr>` and `oem screenshot`.
+- PHONE-BOOT PLAN (S1, host-side findings 2026-11-05):
+  * ios-sweet loader.c (MMU off, initrd from /chosen, copies segs to phys_base, builds boot_args, jumps) is 4K-agnostic -> reuse in an S1 shim (S0 + loader + fdt). Payload = SWEETXNU from mkpayload.py in the boot-image ramdisk.
+  * Reserved carve-outs (kernel DTB): 0x83200000 splash fb (0x5eec00), 0x85b00000.., smem 0x86300000, mpss 0x86c00000-0x8c200000, lpass 0x8c200000+0x1800000, dynamic pools 0x86800000-0x8e800000 and 0xa0000000+0x2000000. XNU RAM must sit above 0x90000000; real RAM banks must be read live (`fastboot oem dtb` / `oem parsed-tags`) — memory node in the DTB is size 0 (filled by lk2nd).
+  * LK2nd ramoops is at 0xbff80000 (not 0xdffc0000; reading 0xdffd0000 via `oem debug readl` crashed lk2nd/phone). Use only addresses known to be RAM.
+  * XNU video console (video_console.c) only handles v_depth 8/16/32; our splash fb is 24bpp (r8g8b8, stride 3240) => sweet_early.c (uint32 writes) and the vc console must get a 24bpp path or a 32bpp shadow buffer + copy-out (ios-sweet copies frames to the FB in its IOSurface/IOMFB patches 0046/0056, which also assume 32bpp).
+  * mkadt.py has SM7150 constants (GICv3, UFS, FB 0x9c000000 1080x2400x4, VTIMER 19): need a shamrock variant (GICv2 0x0b000000/0x0b002000, timer INTID 20, FB 0x83200000 1080x1920x3, MPIDR 0x000/0x100 clusters, no UFS -> eMMC later).
+- S1 SHIM (work/s1): lk2nd -> shim -> SWEETXNU payload from initrd (/chosen linux,initrd-*) -> xnu. ios-sweet loader.c/fdt.c reused as-is (MMU off, 4K-agnostic). `./build.sh <payload.bin> [qemu]`. QEMU TEST PASSED: `qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a53 -m 4G -kernel s1/out/Image -initrd q-r13/payload.bin` boots xnu to the IOFindBSDRoot (md0) panic; framebuffer dump shows full panic log.
+  Phone variant (`./build.sh` without qemu) compiles but is NOT usable yet: the fb is 24bpp, xnu wants 32bpp. DECISION: shim must reprogram MDP5 (0x1a01000) to scan out a 32bpp buffer (XNU_FB_BASE in s1con.h, placeholder 0x90000000 — must be a RAM range excluded from the ADT memory map) instead of patching xnu's console/IOSurface for 24bpp. Needs live MDP register reads from lk2nd (`fastboot oem debug readl`, display must be ON; only on addresses known to be mapped) — requires the phone.
+  Next host-side: shamrock mkadt (GICv2, timer INTID 20, RAM above 0x90000000 minus fb, MPIDR clusters), then GICv2 driver patch.
+- GICv2 DONE in QEMU (patch 0109, CI run 41988547536, `work/qtest2.sh <run> <name>` with tools/ = qemu-sweet.py gic-version=2 + mkadt `--gicv2`): xnu boots with cortex-a53 + virt,gic-version=2 to the same IOFindBSDRoot(md0) panic; live GIC regs verified through QMP: GICD_CTLR=1, GICC_CTLR=1, GICC_PMR=0xff, ISENABLER0 has the timer PPI (INTID 27 in QEMU) enabled. On the phone the vtimer INTID comes from ADT `virtual-timer-intid` (20 = PPI 4); IPI target mask is measured from GICD_ITARGETSR0 at init, fallback aff1*4+aff0 (verify on phone: boot CPU is MPIDR 0x100).
+- Host gotchas: docker-created files are root-owned (remove via `docker run ... rm -rf`); QEMU monitor socket is QMP (use human-monitor-command); qemu-sweet.py out dir must be fresh.
+- MSM8952 ADT (tools-shamrock/mkadt.py --shamrock): 8x A53, boot CPU MPIDR 0x100 first, GIC-400 (GICD 0x0b000000 / GICC 0x0b002000), vtimer INTID 20, 19.2 MHz, no UFS; 32bpp scanout buffer reserved at 0x90000000 (9MB), xnu RAM 0x91000000..0xbff00000 (~750MB; real DRAM banks still unconfirmed). Patch 0110 forces 16K software pages (arm_init) independent of RAM size so iPhone X userland keeps 16K. Verified in QEMU (CI 41991426518 -> r15, same IOFindBSDRoot).
+- MDP5 probe (work/probe, read-only): dumps HW_VERSION, DISP_INTF_SEL, VIG0/RGB0/RGB1/DMA0 SSPP regs (SRC_SIZE/IMG_SIZE/OUT_SIZE/SRC0_ADDR/YSTRIDE0/FORMAT/UNPACK/OP_MODE) and CTL0-2 (LAYER0/1, OP, FLUSH) from MDP base 0x01a01000 to the 24bpp screen for 40 s, then APSS-watchdog reset to lk2nd. Run only with the phone in lk2nd: `fastboot boot work/probe/out/probe-boot.img` and read the screen (photo). Needed to write the shim's MDP5 32bpp reprogram. Not run yet (phone off USB, user said let it charge).
+- Root image path: tools/mkiosroot.sh needs host sudo mounts (apfs-fuse, loop hfsplus) + AUR hfsprogs/apfs-fuse-git (PKGBUILDs read: sources = fedora/GitHub sgan81, OK). Not started; privileged host operations, do later deliberately.
+- MDP5 LIVE DISPLAY STATE (read via lk2nd `oem debug readl`, one address per call; no resets): MDP base 0x1a01000, HW_VERSION 0x100c0000, DISP_INTF_SEL 0x100 (DSI), only RGB0 (0x1a15000) active on CTL0 stage 0 (CTL0.LAYER0=0x200): SRC_SIZE=IMG=OUT=0x07800438 (1080x1920), SRC0_ADDR=0x83200000, YSTRIDE0=0xca8 (3240), SRC_FORMAT=0x0002243f (RGB888 tight), UNPACK=0x00020001, CTL0.OP=0x1f20. My decode of the Linux mdp_format table reproduces these exactly.
+- MDP5 32bpp SWITCH WORKS ON THE PHONE (work/mdptest): write RGB0 SRC_FORMAT=0x000236ff, UNPACK=0x03020001 (XRGB8888: B,G,R,X), YSTRIDE0=4320, SRC0_ADDR=<new fb>, then CTL0.FLUSH |= 0x8. User saw the 32bpp test text. => xnu keeps its stock 32bpp console/IOSurface code.
+- `mdptest`/`probe` first run (probe: all-at-once register dump) reset the phone immediately; single-register reads through lk2nd were fine. A reset returns to lk2nd automatically (boot partition empty). Scan helper: work/mdpscan.sh.
+- RAM facts: 0x90000000 and 0x90800000 are readable RAM; lk2nd's ramoops at 0xbff80000 suggests RAM bank 0x80000000-0xc0000000; reading 0xdffd0000 resets the phone (outside RAM).
+- ***** XNU BOOTS ON THE REAL PHONE (2026-11-05 ~12:05, GM 5 Plus serial 7bedada) *****
+  Chain: lk2nd (RAM-booted S1 image) -> S1 shim (copies SWEETXNU payload from ramdisk, switches MDP5 RGB0 to the 32bpp buffer at 0x90000000) -> xnu-8796 (CI run 41997922758: patches 0100-0111) with the shamrock ADT.
+  Photo shows the xnu console: SWEET EARLY stages, kprintf, zone_init, VM bootstrap done, IOKit/ATM/firehose/log queues, kdp, SWEET PRNG/pthread/AMFI/platform expert, "SWEET FB: AppleCLCD 1080x1920 stride 4320 at 0x90000000 ... presented as 1125x2436", AKS, WDT, HID buttons/touch, BATTERY fallback. GICv2 + vtimer (INTID 20) + 16K-software-pages-on-4K-hardware work on the A53.
+  Image: work/s1/out/S1-boot.img (payload work/phone.payload = shamrock ADT + kernel xnu-r16, cmdline `debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam rd=md0`). Next: rd=md0 has no ramdisk -> expected IOFindBSDRoot panic; need a root (ramdisk now, eMMC later), SMP (cpus>1), real RAM size.
+- See notes/DISABLED-OR-DEFERRED.md for everything switched off or postponed.
+- Phone observations: xnu console reaches "SWEET BATTERY: static fallback" then the boot-progress bar advances EXTREMELY slowly (user watched it). Ruled out: SM7150 input/USB/UFS drivers (only started from the UFS root path). Candidates: A53 CPUECTLR.SMPEN off (caches ineffective), low CPU clock, or genuinely stuck waiting. Plan: let it run to the end, then work on speed (work/cpuinfo reads CPUECTLR/ACTLR/L2CTLR).
+- CPU REGISTERS (cpuinfo on phone): CPUECTLR=0x40 (SMPEN=1: coherency OK, NOT the slowness cause), CPUACTLR=0x090ca000, L2CTLR=0x03000021, CLIDR=0x0a200023, CTR=0x84448004, ACTLR_EL1=0, SCTLR=0xc00800 (MMU/caches off at lk2nd handoff), MIDR 410fd034, MPIDR 80000100.
+- xnu on phone STALLS after "SWEET BATTERY" (user watched 40 min, bar half full): not a hang in the kernel proper (QEMU harness with the same shamrock-like 8-cpu ADT reaches the IOFindBSDRoot md0 panic quickly). Next: boot with `io=0x3f` (IOKit attach/probe/start/register/match/config logging) to see the last service touched: work/S1-boot-io.img. Ruled out: SMPEN, cpu nodes, SM7150 drivers (only start via UFS root path).
+- io=0x3f photo (phone): stall is AFTER the IOKit matching of the platform tree (last visible: `arm-io::attach / Registering arm-io / config(1): creating` after SweetHIDButtons/Touch/SweetBattery matching). QEMU harness (8-cpu ADT, same kernel) continues to the IOFindBSDRoot panic. Next: kernel "stall dump" (after N s dump thread states/wait events to a RAM buffer outside xnu's memory, e.g. 0xbff40000, then APSS-wdt bite -> lk2nd -> read via `oem debug readl`). Needs DRAM to survive the wdt reset: work/ramtest tests that (pattern 0xC0DE00xx at 0xbff40000).
+- STALL ROOT CAUSE FOUND (2026-11-05 ~13:35): stall dump (patch 0112, boot-arg sweetstall=<s>; DRAM survives the APSS-wdt reset, read via work/readdump.sh + symdump.py) showed kernel_bootstrap_thread blocked in kperf_init_early -> ml_wait_max_cpus: ml_set_max_cpus is only called by SweetCPU::startAll. My `mkadt --shamrock` had changed the cpu nodes' compatible from `qcom,kryo470` to `ARM,cortex-a53`, which SweetCPU's personality matches on => no CPU driver => no ml_set_max_cpus => infinite wait (not slowness). Fix: keep `qcom,kryo470` in the ADT. Next panic (photo): "SWEET CPU: expected boot MPIDR 0 and logical CPU 0 @SweetCPU.cpp:149" -> patch 0113 (accept boot MPIDR 0x100, A53 topology 0x000-0x003/0x100-0x103). CI 42012056247.
+- ON THE PHONE (13:4x, kernel CI 42012056247, patches 0100-0113): xnu now reaches the same panic as QEMU: "IOFindBSDRoot: specified root memory device, md0, has not been configured @IOKitBSDInit.cpp:826" = boot through IOKit + BSD init works, only the root is missing. Next: ramdisk with sweet-init (work/S1-r18-init.img).
+- eMMC (sdc1 @0x07824900, SDHCI v3 compatible, Qualcomm SDCC): after `fastboot boot` lk2nd has put the controller back into legacy MCI mode. Diff lk2nd(working) vs shim: CORE+0x78 CORE_HC_MODE 1 vs 0 (must be set to 1), CORE_DLL_STATUS (HC+0x108) 0x9fd vs 0x87d (DLL locked in lk2nd; not needed for slow modes). After HC_MODE=1 the SDHCI side restarts at defaults (CLKCTL 0x000f0003, power 0): need power control 0x29=0x0b (1.8V) + the Qualcomm power-irq handshake (core regs CORE_PWRCTL_STATUS 0xdc / MASK 0xe0 / CLEAR 0xe4 / CTL 0xe8: write STATUS to CLEAR, ack bit0 BUS_SUCCESS / bit2 IO_SUCCESS), SD clock enable (CLKCTL bit2), 400 kHz id clock = 200MHz/(2*250). With that CMD0 completes. CMD1/CMD5 then fail with Command Timeout (err 0x00018000): card gives no response -> suspect the card/IO supplies (pm8950 L8 vmmc, L5 vqmmc via RPM) or pad voltage config. Logs: work/emmc13.txt, emmc14.txt. Test code: work/emmctest/emmctest.c (32-bit accesses only; send_cmd, set_clock, read_data_cmd are the future driver).
+- lk2nd rule added: `oem debug spmi-regulators` (long output) HANGS lk2nd when run under `timeout`; do not run long-output oem commands.
+- eMMC state after `fastboot boot`: controller at defaults after HC_MODE=1 (CORE_HC_MODE), host ctl2 left in UHS mode 3 (SDR104) -> cleared; CMD0 completes, but CMD1/CMD5(awake rca 0..8) time out (card silent) => card sleeping with Vcc (pm8950 L8 2.95V / vqmmc L5 1.8V) probably switched off by LK's target_uninit (mmc_put_card_to_sleep). Next: power L8/L5 through the PMIC (SPMI) from the shim, then CMD0/CMD1 init. `oem debug readpmic` always returns 0 (format unknown); `oem debug spmi-regulators` prints regulator states (must not be killed by `timeout`; redirect to a file and wait).
+- RAM (lk2nd tags, work/tags-staged.txt = FDT): memory@80000000 reg = {0x20000000 +0x60000000, 0x80000000 +0x60000000} (3 GB advertised); 0x20000000 is readable (LK scratch, holds the downloaded boot.img) but 0x50000000 is NOT (phone reset) -> the map is not contiguous RAM; do not probe more. xnu RAM stays 0x91000000..0xbfe00000 until the real bank layout is known.
+- ***** eMMC READS WORK FROM OUR OWN CODE (2026-11-05 evening) *****  work/emmctest/emmctest.c, result work/emmc23.txt: after `fastboot boot` the card is NOT powered down (pm8950 L8 st1=0x80 on, L5 ok; SPMI arbiter v2: core 0x0200f000, APID map at core+0x900, chnls 0x02400000, obsrvr 0x02c00000, ee=0, pm8950 = SID 1). Needed sequence (all 32-bit accesses to HC @0x07824900, core @0x07824000):
+  1. core+0x78 (CORE_HC_MODE)=1  2. host ctl2 (HC+0x3c upper half): UHS mode select=0, 1.8V signaling bit3  3. CORE_VENDOR_SPEC (HC+0x10c) &= ~0x003c0000 (clear HC_SELECT_IN_EN + HS400/SDR104 sampling select; lk2nd leaves HS400 sampling on)
+  4. power ctl 0x29=0x0b + ack Qualcomm power irq (core 0xdc status -> 0xe4 clear, 0xe8 ctl = bit0 BUS_SUCCESS / bit2 IO_SUCCESS)  5. host ctl 0x28 byte0 = 0x00 (1-bit!) until the card is switched  6. clock 400 kHz = base 200MHz/(2*250), internal clock, wait stable, SD clock enable
+  7. CMD0, CMD1 loop (arg 0x40ff8080, ocr 0xc0ff8080 = sector mode), CMD2, CMD3 (rca=1), 25MHz, CMD7 select, CMD8 EXT_CSD (sec_count 0x03a3e000 = 29.1 GiB), CMD6 buswidth 8 (0x03b70200) + host 8-bit, CMD6 HS (0x03b90100) + host high-speed bit + 50 MHz, CMD13 (0x900), CMD17 LBA0 -> 0xaa55.
+  PIO reads: wait PRESENT bit11 (buffer read enable) and read BUFFER_DATA_PORT (HC+0x20); normal-int status-enable bits must not be relied on. Next: port to an xnu block driver (like ios-sweet sweet_ufs.c: bdevsw/cdevsw + GPT scan of `userdata` + sweet_ufs_rootdev equivalent), then flash the HFS+ iOS root to userdata.
+- iOS ROOT IMAGE built & flashed (2026-11-05 evening): work/root/iosroot.img (16 GiB HFS+ case-sensitive, journaled, 12 GB used; /sbin/launchd, dyld shared caches under /System/Library/Caches/com.apple.dyld, systembag.kb). Built with the privileged docker image ios-shamrock-aur (rsync code 23 = symlink chmod unsupported on hfsplus, tolerated via work/root/mkiosroot-shamrock.sh). `fastboot flash userdata iosroot.simg` (sparse, 24 chunks) - ONLY userdata is written (24.8GB; other partitions untouched). Chunks 1-23 OK; chunk 24 hung (lk2nd stalled after I issued a concurrent `fastboot getvar` during the flash: NEVER run another fastboot command while a flash is running). Re-flash needed.
+- Kernel eMMC root driver: patch 0114 bsd/dev/sweet_emmc.c (SDHCI PIO, boot-arg emmcroot=<gpt name>, default userdata, read-only; rd=emmcroot0 hooked in IOKitBSDInit.cpp). CI 42081543999 OK. Phone image with rd=emmcroot0: work/S1-emmc.img (payload phone-emmc.payload, sweetstall=240).
+- eMMC ROOT PROGRESS (2026-11-07): kernel driver (0114-0117). Failures found one by one via the RAM log + watchdog reset trick (sweet_emmc.c ELOG -> 0xbff40000 -> readdump.sh): (1) CMD2/CMD3 timeout in the kernel: status-enable (HC+0x34) must be written explicitly after the HC mode flip (0116). (2) Next panic (photo): `bdevvp failed: open @vfs_subr.c:2166` = spec_open on VBLK calls DKIOCSETBLOCKSIZE and returns ENXIO if it fails -> block device ioctl table needs DKIOCSETBLOCKSIZE, MAXSEGMENTCOUNT, SYNCHRONIZE (0117). So the eMMC init, GPT scan and root device lookup (rd=emmcroot0) WORK in the kernel.
+- CI note: GitHub removed the macos-14 runner ("configuration macos-14-arm64-us-default is not supported"); macOS arm64 runners also hit capacity limits ("job was not acquired"); workflow now uses `macos-15-intel` (cross-compiles the arm64 kernel fine, ~15-20 min, `gh run watch` may disconnect: re-attach).
+- HFS MOUNT FAILURE FOUND (2026-11-07, run 5, patch 0118 msgbuf in stall dump): root device emmcroot0 is found and opened (bdevvp ok after 0117), vfs_mountroot loops "mount(N) failed" every 5 s. Cause from msgbuf: `hfs: Initializing the journal (joffset 0x82000 sz 0x800000)... jnl: write_journal_header: error writing the journal header! ... hfs_mounthfsplus: hfs_late_journal_init returned (22) ... cannot mount root, errno = 19`. The image's volume header is journaled but the journal was never created; hfs creates it at mount, my driver was read-only. Fix: PIO write support (CMD24 + CMD13 busy poll) in sweet_emmc.c (patch 0119); writes are bounds-checked to the userdata partition only. 
+- stall dump now prints the tail of msgbuf (MSGBUF section) -> use `emmc-runN.sym.txt` and grep for hfs/mount lines. Boot-arg sweetstall=100 is enough.
+- LAUNCHD STARTS (2026-11-07): with patches 0118/0119 the HFS+ root mounts read-write from eMMC and /sbin/launchd runs (pid 1 "init"); photo panic: `unexpected SIGKILL of launchd (CS_KILLED) with reason -- namespace 9 code 0xe` (code-signing invalid page). Prepared work/S1-emmc7.img (CI run 42320338621) with `cs_enforcement_disable=1 amfi_get_out_of_my_way=1 cs_debug=1`; not yet booted. Phone is on the panic screen (user must power-cycle, then start lk2nd).
+- CORRECTION (2026-11-07): the launchd kill is OS_REASON_EXEC (9) / EXEC_EXIT_REASON_WRONG_PLATFORM (0xe), raised in process_signature() (kern_exec.c, XNU_TARGET_OS_OSX block): cs_enforcement_disable did nothing (image emmc7 gave an identical panic). Fix: boot-arg unentitled_ios_sim_launch=1 -> work/S1-emmc8.img (not yet booted).
+- 2026-11-07 emmc8 result: unentitled_ios_sim_launch=1 works; launchd runs, launchd_cache_loader(23) dies "Unable to find AMFI" (OS_REASON_LIBXPC). ios-sweet notes the same wall: fix launchd_unsecure_cache=1 (+ wdt_test=no_user_checkin, wdt=-1, ignition_level=1). Prepared work/S1-emmc9.img. The ios-sweet NOTES.md lists all following walls (keybag, watchdogd, coredumps, tzinit, ...), and tools/sweet-root-tweaks.py must be applied to the iOS root later.
+- 2026-11-07 emmc9 RESULT (launchd_unsecure_cache=1 etc., sweetstall=200 dump): NO PANIC. launchd boot tasks pass, ~99 execs (xpcproxy, powerd, aggregated, identityservicesd, IOMFB_FDR_Loader, ...), **backboardd exec'd at t=92 s**, SWEET AKS keybagd selector 0 answered; the dump was just the 200 s stall timer. Next: emmc10 = sweetstall=600 + sweetfb_noconsole=1 sweetfb_hz=30 (GUI visible). msgbuf tail is only the last ~120 s (24 KB) because memorystatus spam: consider raising the dump size in sweet_stall.c.
+- 2026-11-08 iPhone 8 Plus (D21AP / iPhone10,2) Rootfs & Patch 0126 Complete:
+  * IPSW iPhone_5.5_P3_16.7.16_20H392_Restore.ipsw downloaded and extracted (OS 087-86694-044.dmg, SystemOS 087-86588-047.dmg, AppOS 087-86715-047.dmg).
+  * Built HFS+ root image `iosroot-8plus.img` with native 16:9 5.5" legacy visual provider (eliminates notch layout & `rdar:45025538` red status bar).
+  * Injected Shamrock tweaks: AssistiveTouch enabled on-screen (`AssistiveTouchEnabled: true`), screen auto-dim & auto-lock disabled (`SBDisableAutoDim: true`, `SBDisableAutoLock: true`).
+  * Truncated cleanly at real data end (12,514,754,560 B, 11.66 GiB) to prevent lk2nd stall, converted to Android sparse image `work/root/iosroot-8plus-trunc.simg`.
+  * Built boot payload `work/S1-d21-r32.img` with CI kernel run 42426229398 (Patch 0126: 1:1 Aspect-Fit uniform scaling for circular Apple logo, Adreno 405 GPU driver, 160px edge touch, `sweethidtest=5`). Ready to flash to `userdata` and boot!
+- emmc11 (cpus=8, sweetstall=150): photo panic `SWEET CPU: cpu=4 unsupported restart @SweetCPU.cpp:259`; cores 1-3 (MPIDR 0x101-0x103) came up and idle; cores 4-7 (MPIDR 0x000-0x003, cluster 0) not started: startCPU() rejected phys_id==0. Patch 0120 removes that check. GIC SGI target mask for cluster 0 uses the fallback 1<<(Aff1*4+Aff0) (to verify). Patch 0121: eMMC ADMA2 multi-block reads (CMD18, 1 MiB bounce, auto CMD12), PIO fallback, boot-arg emmcnodma=1 disables.
+- Idea (user): use only the boot cluster. cpus=4 = MPIDR 0x100-0x103 (cores 1-3 verified alive in the cpus=8 panic photo), needs no new kernel. Image S1-emmc13.img (cpus=4, sweetstall=1500, sweetfb_noconsole=1). Cluster 0 later with patch 0120.
+- 2026-11-07 emmc14 (kernel CI 42329900669 = patches 0100-0121; cpus=4 + ADMA2 eMMC reads): user reports the boot is MUCH faster than the cpus=1 + PIO runs (previous: first IOMFB frame at ~690 s). The two changes were tested together, so the individual contributions are not separated (emmcnodma=1 turns ADMA off for an A/B test; cpus=1 vs 4 likewise). Images: S1-emmc14.img (cpus=4), S1-emmc15.img (cpus=8, cluster 0 via patch 0120, untested). Note: an earlier CI run (42329777450, 0120 only) was cancelled by dispatching the next one (workflow concurrency); only 42329900669 is valid.
+- 2026-11-07 ROOT TWEAKS: ios-sweet's tools/sweet-root-tweaks.py was applied to work/root/iosroot.img (work/roottweak.sh in the privileged aur container: fsck, `mount -t hfsplus -o rw,force`, run script): 7 _PanicOnCrash renamed, 2 CommCenter jobs removed, container dirs created, VirtualAudio plugin disabled, MediaToolbox StartRecorderServer off, com.apple.migration LastSystemVersion (no hour-long DataMigration), SpringBoard BKNoWatchdogs, Setup/purplebuddy skipped. "no mobileactivationd system container" -> data ark not seeded (activation state may still need work). After the Linux rw mount fsck -n reports "volume header needs minor repair (1,0)" even after fsck -fy: the same state the originally flashed image had; the kernel mounted it fine. Truncated at data end 12527337472 bytes (11.667 GiB; scan must skip the last 2 MiB = alternate volume header) -> work/root/iosroot2-trunc.simg (12145302776 B). Flashed with `fastboot -S 512M flash userdata iosroot2-trunc.simg` (log flash-userdata4.log). The old state is work/root/iosroot-trunc.simg. Hypothesis: the endless boot progress bar was DataMigration (ios-sweet: "runs for an hour on every boot" without these prefs).
+- Patch 0122 (CPU bench `SWEET BENCH:`, eMMC `SWEET EMMC: N MiB read, X KiB/s`, msgbuf window 120 KB in the stall dump): CI run 42334343690.
+- User note: the phone got hot during long runs; the owner says that is fine (pmOS stress tests ran hotter, multiple identical phones available). No thermal management exists in this kernel.
+- FLASH PITFALL #2 (2026-11-07): `fastboot -S 512M flash userdata iosroot2-trunc.simg` failed at chunk 9/24 with `remote: 'data too large'` (chunk 524266 KB; the earlier image's chunks were all <= 518160 KB). userdata was left half-updated (chunks 1-8 new): do NOT boot in that state, always reflash completely. Retried with `-S 256M` (log flash-userdata5.log). Use -S 256M from now on.
+- 2026-11-07 ROOT REFLASH OK: `fastboot -S 256M flash userdata iosroot2-trunc.simg` finished 47/47 chunks, no FAILED, 552 s (flash-userdata5.log). userdata now = tweaked root (ios-sweet sweet-root-tweaks.py). Earlier -S 512M attempt had failed at chunk 9 ("data too large") and had left userdata half-written; that state was fully overwritten by this run.
+- Booted work/S1-emmc16.img from lk2nd: kernel CI 42334343690 (patches 0100-0122: ADMA2 eMMC, SMP fix, bench/stats), cmdline `debug=0xc serial=3 cpus=4 keepsyms=1 -enable_kprintf_spam rd=emmcroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30 sweetstall=900`. First boot with the tweaked root: result pending (watch boot speed, what appears after the progress bar, panics; afterwards read the RAM log for `SWEET BENCH:` and `SWEET EMMC: N MiB read` lines).
+- The emmc14 RAM log was never read (phone reset while busy; reading was skipped at the owner's request to boot first). Probably gone by now.
+- TODO after a screen appears: prune more launchd jobs (bluetooth, NFC, softwareupdated, healthd, passd, WirelessRadioManager, analytics...) in launchd.plist on a backup copy; cpus=8 (S1-emmc15.img, cluster 0 via patch 0120); touch/buttons check; activation data ark (no mobileactivationd container in the image).
+- 2026-11-08 (takeover after another agent): r37 run log (S1-d21-r37-log.img, sweetstall=420): `SWEET HID: key 0x40 down/up` exactly every 5 s = boot-arg sweethidtest=5 injects a fake HID Menu/Home press every 5 s -> SpringBoard keeps returning to the home screen, Settings cannot stay open. Remove sweethidtest. No log had been captured for ~14 h before (since 05:54); GPU stack (Mesa freedreno OSMesa + eagl bridge + DYLD inject 0127 + HakiosGPU 0125) never verified. Root cause for "red clock / black wallpaper": dyld ignores DYLD_INSERT_LIBRARIES because no MAC policy named "AMFI" answers __mac_syscall("AMFI", 0x5a) (ours was named "SWEET AMFI"): patch 0128. Kernel GPU user client issues: non-contiguous buffers but only the first page's phys address given to the GPU, no cache maintenance, SMMU not programmed.
+- 2026-11-08 ROOT CAUSE OF THE LOST GPU DAYS: patch 0127 (exec inject) was CORRUPT (`git apply`: corrupt patch at line 108). Upstream dxb build.sh only warns "Skipping patch ... malformed" and continues, so NO kernel ever contained the inject code (`strings` of xnu-r35/r36/r37: 0 hits for "injecting DYLD_INSERT_LIBRARIES"). The last successful CI (42500013421) skipped exactly 0127 among our patches. Also the local work/xnu-tree had diverged from what CI builds (SweetAdreno.cpp, SweetFramebuffer.cpp differ from 0124+0125+0126). Fixes: 0127 removed from the fork, replaced by 0129 (same inject code, rebuilt on a CI-equivalent tree = xnu-tree@0124 + repo 0125 + 0126, plus Adreno logs: `SWEET A405: user client opened by X`, `submit #N`, `fence N TIMEOUT`); workflow now fails if any 01xx patch does not apply; 0128 = policy named "AMFI" answering dyld's 0x5a (allow DYLD_*) and 0x60. CI run 42507139373 (0128+0129).
+- Injector (gpu/shamrock_inject.c) logs to /dev/console + syslog, which do NOT reach the kernel msgbuf; backboardd/SpringBoard writes to /dev/null DO (patch 0048 tee, "|backboardd| ..."). Kernel-side evidence comes from 0128 (sweet_amfi_debug=1) and 0129 logs.
+- Next image cmdline: drop sweethidtest=5 (fake Home key every 5 s), add sweet_amfi_debug=1, sweetstall=200 to catch boot-time GPU init + injection lines in the msgbuf window.
+- 2026-11-08 r38 RESULT (0128+0129 verified in the kernel binary): `SWEET AMFI: dyld policy ... allow all` for every process; `SWEET A405: user client opened by backboardd`; `|backboardd| redwood-gl: an OpenGL ES 3 context for CoreAnimation, by Mesa ... softpipe` -> injection and the GL bridge WORK, but `MESA: error: fd_pipe_new2:34: allocation failed` -> freedreno falls back to softpipe. Cause: 0125's HakiosGPUUserClient speaks a different protocol than the userland hakios-drm shim: userland sends selector DRM_COMMAND_BASE(0x40)+index (GET_PARAM 0x40, GEM_NEW 0x42, SUBMIT 0x46, SUBMITQUEUE_NEW 0x4a), DRM_IOCTL_GEM_CLOSE 0x09, HAKIOS surface 0x7e, user memory 0x7d; 0125 expects 0..11 (submitqueue off by one), 0x7c, 0x7f, reads drm_msm_param at the wrong offset, and returns kIOReturnSuccess for unknown selectors -> GET_PARAM "succeeds" with gpu_id=chip_id=0 -> msm_pipe_new fails. The matching kernel side is HackiOS's gpu/kernel/hakios.gpu.cpp (already in the tree, unused). It needs hooks hakios_gpu_address/map/unmap/mapped (GPU SMMU page table), to_memory (cache), submit/done/last/worked/report/stop/ready/parameter.
+- GPU SMMU from the phone DT (work/cpuinfo/shamrock.dtb): gpu@1c00000 `iommus = <&gpu_iommu 0>, <&gpu_iommu 1>`; gpu_iommu = iommu@1f08000 "qcom,msm8952-iommu", "qcom,msm-iommu-v2", qcom,iommu-secure-id = 0x12, ctx@0 non-secure (ASID 0, irq 0xf0), ctx@1000 secure (ASID 2), ctx@3000 secure (ASID 1). Linux reference: drivers/iommu/arm/arm-smmu/qcom_iommu.c (qcom_scm_restore_sec_cfg + secure ptbl init, then ARM SMMU context-bank registers TTBR0/TCR/MAIR/SCTLR). Plan: (1) measure with work/S1-d21-r38-early.img (sweetstall=75, no sweethidtest): early `SWEET A405:` init lines (does CP_ME_INIT pass with physical addresses?) and ctx0 SCTLR state; (2) SMMU ctx0 page table + register programming; (3) port hakios.gpu.cpp onto it; (4) Mesa triangle test; (5) backboardd.
+- 2026-11-08 early GPU log (S1-d21-r38-e45.img, sweetiolog=none sweetstall=45; the IOKit trace "IOK ..." of backboardd/SpringBoard had filled the msgbuf before): `SWEET A405: GDSC powered on, all 9 GPU clocks active at 400 MHz`, `resetting GPU core`, `Adreno 405 initialized (RB_BASE=0x93065000)` -> CP_ME_INIT completed (RPTR reached WPTR) with the ring at a PHYSICAL address: the GPU SMMU (iommu@1f08000) is in bypass after the boot chain. Faster dump reader: work/readdump.sh now uses `oem debug readq` (8 bytes/call, ~10 ms/call, 113 KB in 1m49s; old one-word reader kept as readdump-readl.sh; optional 2nd arg = max bytes).
+- PATCH 0130 (CI 42515800149): HakiosGPU.cpp = HackiOS gpu/kernel/hakios.gpu.cpp (the user client that matches the userland hakios-drm protocol) with a SweetSurface adapter (MiniIOSurface = SweetSurface, pixels at offset 0, seed via new sweet_surface_seed_value(), new SweetSurface::drawn field); SMMU bypass: newBuffer() accepts only physically contiguous memory below 4 GiB and uses the physical address as GPU address; GEM buffers allocated kIOMemoryPhysicallyContiguous; SweetSurface pixels contiguous when possible. SweetAdreno.cpp (0125) keeps power/clock/reset/CP init (class renamed SweetAdreno, personality updated) and the hooks; fixed its submit: CP_WAIT_FOR_IDLE had no payload word (corrupted the stream), the fence was written before completion and CACHE_FLUSH_TS had no address/value -> now Linux a4xx order with a memory fence (g_fence_mem), ring space check, GPU_ID 405, hakios_gpu_report() prints fence/rptr/wptr/RBBM_STATUS.
+- Test plan for 0130: boot with sweetiolog=none and a short sweetstall; expect `SWEET A405: ready; HakiosGPU service started`, no `MESA: error: fd_pipe_new2`, redwood-gl renderer string "FD405" instead of "softpipe", no `fence ... TIMEOUT` / `GPU report (no answer)`.
+- 2026-11-08 *** r39 (patch 0130): MESA USES THE ADRENO 405 *** `|backboardd| redwood-gl: an OpenGL ES 3 context for CoreAnimation, by Mesa, off-screen (OSMesa): OpenGL ES 3.1 Mesa 25.0.7; FD405`, GL_RENDERER "FD405", no fd_pipe_new2 error. Then backboardd crashed (shamrock-inject crash handler, msgbuf): SIGSEGV at 0x30 in _platform_memmove <- IOSurfaceClientGetBulkAttachments <- QuartzCore. Sequence before: SWEET SURF create id 2 1242x2208 2 planes, sel 9, 27, 5, 6. sel 6 = WrapClientImage (7 = WrapClientMemory, HackiOS MiniIOSurface.cpp enum); SweetSurface's default branch zeroes the reply and returns success -> client surface with shared page address 0 -> bulk attachments (shared+0x30) read at 0x30. Patch 0131: refuse sel 6/7 (kIOReturnUnsupported; HackiOS notes CA then draws those images another way). Proper WrapClientImage (HackiOS methodWrapClientImage: 32-byte request address/width/height/format/bpe/bpr/size, made as a create with IOSurfaceAddress) is a later perf item. CI 42520428557.
+- 2026-11-09 CPU CLOCK: SWEET BENCH (20M iterations of add/subs/b.ne) = ~399 it/us at boot. lk2nd leaves the boot cluster (cpu@100-103, DT opp-table-c1 499-1516.8 MHz; mux mailbox@b011000 "qcom,msm8939-apcs-kpss-global", PLL clock@b016000 "qcom,msm8939-a53pll") on GPLL0: APCS mux CFG 0x0b011054 = 0x401 (source 4, div 1 = 800 MHz), A53 PLL mode 0 (off). The other cluster (cpu@0-3) uses clock@b116000, max 1209.6 MHz. S1 shim now programs the A53 PLL (Linux clk-pll sr2 sequence: L/M/N, BYPASSNL, RESET_N, wait status bit16, OUTCTRL) and switches the mux to source 5 (CFG 0x501, CMD bit0 update). Build: `S1_CFLAGS="-DS1_CPU_L=79" work/s1/build.sh <payload>` (L*19.2 MHz; 79 = 1516.8, 0 = untouched). Diagnostics are stored at 0xbff3f000 (survives the wdt reset; read with oem debug readl): 'CLKD', L, CFG before, CMD, PLL mode, status, 0x10c4ed locked, status, 0x5717c4ed switched, CMD, CFG after, mode, L. Result at L=79: locked, CFG 0x501, mode 7; bench 528 it/us (+32%, expected ~1.9x: bench may be noisy (preemption) or another limit, e.g. L2/CCI clock: to investigate). Voltage untouched; 100 s at 1094 and 25 s at 1516 ran fine. An earlier 1094 MHz run without diagnostics showed no speed-up (388 it/us): unexplained.
+- GPU test image (no auto reset): work/S1-d21-r40-gpu-1516.img = kernel CI 42520428557 (0100-0131), shim L=79, cmdline without sweethidtest, sweetiolog=none, sweetstall=0.
+- 2026-11-09 r40 GPU run (0131, 1516 MHz, sweetstall=150): black screen, no Apple logo. Log chain: `vm_page_find_contiguous(num=846,low=0): found 0 pages` (backboardd's render targets: 1242x2208 'b3a8' 2 planes 13.8 MB, created ~100 s after boot when memory is fragmented) -> surface falls back to non-contiguous memory -> HakiosGPU refuses it (no SMMU) -> `redwood-gl: -attachImage: target 0xde1, texture 1, an IOSurface of 'b3a8': not done` -> `glDrawElements: error 0x506` (GL_INVALID_FRAMEBUFFER_OPERATION) every frame -> frames swapped empty. HakiosGPU submissions themselves work (`submission 1: ... 134 words`, no fence timeout). 1516 MHz ran 150 s fine.
+- PATCH 0132 (CI 42524620235): contiguous surface pool taken at IOCoreSurfaceRoot::start while memory is unfragmented (boot-arg sweetsurfpool=<MB>, default 96, falls back by 3/4 down to 16; logs `SWEET SURF: contiguous surface pool N MB at phys 0x...`); surfaces >= 512 KB get pixels from it (IOSubMemoryDescriptor, first-fit + coalescing, SweetSurface::poolOffset/poolSize, returned in free()). SweetFramebuffer swap: if s->drawn (GPU fence) wait MiniIOSurfaceDrawn(s, 50) then flush_dcache64(kva, size) before the CPU copy (GPU writes memory directly).
+- DESIGN NOTE (2026-11-09): the contiguous surface pool (0132) is an INTERMEDIATE STEP, not the final design. It is the classic carveout/CMA approach (Android ION carveout, Raspberry Pi gpu_mem) for a GPU without an active IOMMU, chosen to prove first that the A405 draws correctly into real render targets and to measure the speed-up without also debugging SMMU code. Drawbacks: 96 MB permanently reserved out of ~750 MB; large surfaces fail when the pool is full; surfaces < 512 KB (CoreAnimation textures: icons, glyphs, images) are still non-contiguous, so the GPU cannot sample them in place and they are copied by the CPU. FINAL DESIGN: program the GPU SMMU (iommu@1f08000, "qcom,msm-iommu-v2", secure-id 0x12, ctx@0 non-secure ASID 0; Linux reference drivers/iommu/arm/arm-smmu/qcom_iommu.c, may need the TZ secure-config SMC qcom_scm_restore_sec_cfg) and implement HakiosGPU's hakios_gpu_address/map/unmap/mapped hooks with real page tables, as HackiOS's driver was designed for; then remove the pool and the contiguity check in HakiosGPU newBuffer().
+- 2026-11-09: owner asked to lower the CPU to ~1 GHz (phone got hot, no thermal management): images now built with S1_CPU_L=52 (998.4 MHz, a DT OPP): work/S1-d21-r41-gpu-998.img (no auto reset), work/S1-d21-r41-s150-998.img (150 s log).
+- 2026-11-09 PINPOINT (offline, battery dead): the pool (0132) alone would NOT have fixed the black screen. eagl.c my_attachImage() accepts only `pixels == 'BGRA' (or 0) && IOSurfaceGetPlaneCount == 0 && bpe 4`; backboardd's GL render targets are 'b3a8' with 2 planes -> refused regardless of memory. HackiOS (MiniIOSurface.cpp ~l.470, docs/ru/notes.md l.190-198) makes 'b3a8' one-plane BGRA and 'w30r'/'l10r'/'w30R' BGRA, and writes artwork-display-gamut = sRGB into the device tree (iPhone ADT says P3 -> MobileGestalt HasExtendedColorDisplay -> 10-bit surfaces). Patch 0133 (CI 42528565268): same mapping in sweet_surface_layout() (b3a8 also drops the plane info and the two-plane IOSurfaceAllocSize). ADT: new tool work/tools/adt-setprop.py (parse, verified byte-exact round trip, set C-string property) -> work/shamrock-d21-srgb.adt (artwork-display-gamut "P3" -> "sRGB"). Next images (auto-built after CI): S1-d21-r42-gpu-998.img (no reset) and S1-d21-r42-s150-998.img (150 s log), both 998.4 MHz, ADT srgb.
 
-There is no serial port (the debug UART is wired as SPI on this board). The kernel draws its console into the framebuffer that ABL leaves at `0x9c000000`, and keeps a persistent 4 MiB log ring at the end of `userdata`. You read that log from OrangeFox recovery with `tools/sweet-log-pull.sh`, so you don't have to film the screen.
+### 2026-11-09 — r42 result, 0134 (GPU buffer pool)
+- r42 (0133 + sRGB ADT): attachImage now accepts the render target ('BGRA' 1242x2208). Screen still black.
+- New blocker (dump-r42-s150.txt): `HakiosGPU: no memory for a buffer of 12582912 bytes` → `glTexImage2D: error 0x505` (OUT_OF_MEMORY) → `glDrawElements/glFlush: error 0x506`. Mesa's texture copy of the surface needs 12 MB contiguous; vm_page_find_contiguous finds none after boot.
+- 0134: split the pool into a 96 MB cached surface pool (sweetsurfpool) and a 64 MB write-combined GPU buffer pool (sweetgpupool). GEM buffers ≥512 KB come from the GPU pool (SweetPoolMemory, an IOSubMemoryDescriptor that returns its block on free). Still an intermediate step until the SMMU is used.
+- Apple logo missing is old (seen on earlier builds too), not related.
 
-## How to do it yourself
+### 2026-11-09 — r43 (0134) result and plan notes
+- r43: GPU-rendered lock screen appears (clock updates, no lag). Wallpaper black, clock grey (vibrancy over no wallpaper). Touch dead, all physical keys dead (no shamrock key driver existed: sweet_keys.c targets the SM6150 SPMI v5 arbiter and is only started from the UFS path).
+- Wallpaper: HackiOS inject_media.c says the iOS 16 stock wallpaper is four HEIC layers; without the VideoToolbox decompression service ImageIO cannot decode HEIC and only the gradient remains (they enable the software VCPHEVC codec). To verify in a log; static PNG wallpaper as a fallback.
+- 0135: shamrock_keys.c (PM8950 PON over SPMI v2 observer + TLMM gpio85; volume-down = Home, sweetkeys_home=0 to disable) and touch I2C probe/status lines (0x5d/0x14/0x20/0x48).
+- TODO (owner's request, deferred): display scaling 1242x2208 -> 1080x1920 is currently CPU point sampling in SweetFramebuffer (sweetfb_smooth=0). Bilinear should be done later in hardware: MDP5 pipe scaler scanning the contiguous IOSurface directly (zero copy), not CPU sweetfb_smooth=1.
+- TODO: GPU SMMU (iommu@1f08000) is the real fix for GPU memory; the surface/GPU pools (0132/0134) are intermediate.
 
-You need a Redmi Note 10 Pro (`sweet`, global or Indian variant, SM7150) with an **unlocked bootloader**, a Linux PC, and a GitHub account for the kernel build. This is the exact path used for the screenshots above; other variants or firmware may need changes. **Everything on `userdata` is lost.** Bootloaders, recovery, modem and persist partitions are never touched.
+### 2026-11-09 — r44m/r45/r46 results, web research, 0136-0141
+- r44m (1262 MB ADT `shamrock-d21-srgb-1g2.adt`, pools 160/256): home screen drawn much further, no `no memory`, no jetsam kills; "stuck" = idle (no input). One 256 KB surface refused (not contiguous) -> 0137 (pool from 64 KB).
+- r45 (0136 Himax driver): I2C now real (pins muxed, NACK detected): 0x48 NACK, I2C status 0x0d1300c8 (PACKET_NACKED|FAILED, SDA/SCL idle high). -> 0138 cycles 4 power/reset orders and logs who answers.
+- pmOS notes (kernel-port/docs/pmos-mainline-shamrock.md): this unit's touch = Himax HX852x @0x48 (i2cdetect), power LDO enable = tlmm 91, reset tlmm 64, irq tlmm 65.
+- lk2nd FDT memory (tags-staged.txt, parsed properly): <0x20000000 0x60000000>, <0x80000000 0x60000000> = one run 0x20000000-0xe0000000. The old "0x50000000 read resets" note was LK's own MMU, not missing RAM.
+- Web research: ios-river (Moto G7, MSM8953, Adreno 506) has GPU SMMU via SCM restore_sec_cfg(18) + own CB0 page tables (patches 0161/0166/0167), RAM around firmware holes (0205, 3.38 GB), AMFI trust-query stand-in for PosterBoard (0202); ios-sailfish converts stock wallpaper HEIC layers to PNG at root build (tools/wallpaper-heic2png.sh); river's MDP VIG scaler attempt failed (bootloader's RGB pipe non-scaling).
+- 0139: GPU SMMU CB0 (0x1f08000) translating, SCM probe + restore_sec_cfg(18,0), 1 GiB GPU VA for buffers, ring/fence mapped, smmu_cfg clock vote (bit 12) added, CP self-test, fallback to bypass. sweetsmmu=0 disables.
+- 0140: RAM hole 0x80000000-0x91000000 (osfmk/arm64/shamrock_phys.h); full ADT `shamrock-d21-srgb-full.adt` (dram 0x20000000..0xdfe00000, ~2.8 GB usable). s1 loader.c: ramdisk inside the hole allowed (backup loader.c.bak-prefullram).
+- 0141: AppleMobileFileIntegrity stand-in (river 0202).
+- TODO: wallpaper HEIC->PNG in the root image (needs userdata reflash); MDP/GPU scaling.
 
-### 0. Back up the phone
+### 2026-11-09 (later) — touch works, SMMU on, 2.8 GB RAM boots
+- r47old/r49old: GPU SMMU ON (`HakiosGPU: [SMMU on]`, SCM restore_sec_cfg(18) accepted). 0144: GEM buffers no longer contiguous when SMMU is on.
+- Touch: probe found a Goodix GT9xx at **0x14** (INT high at reset release), not the Himax pmOS saw. 0144 Goodix path, 0146 goodix_int_sync (INT low 50 ms, then input) -> contacts arrive; r51full: AssistiveTouch panel and Control Center open by touch. 0148: release debounce (drags came as taps).
+- Full RAM (dram 0x20000000-0xdfe00000): chain of fixes
+  - lk2nd puts the initrd at 0x23600000 (DTB 0x23400000): s1 loader relocates it to 0x81000000 (hole). s1 also discards D-cache by set/way at entry (S1_MEMTEST builds print RAM/ADT/alias checks; ALIAS60 hits=0: no aliasing; Android's dmesg shows the same 3 GB map 0x20000000-0xdfffffff).
+  - 0142: hole 0xbff00000-0xc0000000 (stall dump page; r47small panicked mapping it as I/O while in use).
+  - 0145: BOOTSTRAP_TABLE_SIZE 8 pages (no ARM_LARGE_MEMORY on shamrock) overflowed with 2.8 GB -> 16 for SWEET; bootstrap maps clamped at 0x80000000 (never map TZ); early fb gets its own L2.
+  - kmem_range_init: compressor claim 48 GB (XNU_TARGET_OS_OSX: 16x max_mem) > 44 GB largest hole -> boot-arg `vm_compression_limit=262144` (4 GB). 0147 prints claims on failure.
+  - r51full-con-vc: lock screen with ~2.7 GB free pages; boots noticeably faster.
+- 0149: GEM IOBMD's kernel view is cached even with kIOMapWriteCombineCache: zeroing left dirty lines written back over Mesa's WC writes (blank icons, dock garbage, Mesa "msm dump submit"). Clean+invalidate after allocation (ios-river 0192).
+- lk2nd has `oem ramoops raw/dump`, `upload`, `oem screenshot` (fast USB staging); `oem ramoops raw` hung once when killed by timeout (do not kill oem commands). lk2nd ramoops region 0xbff80000.
+- Still open: wallpaper (HEIC/PosterBoard), "press home to open" text, widgets "Waiting...", icon IOSurfaces with pixel format '' (0), Mesa errors only on console (not in kernel log), MDP/GPU scaling, 8 cores, RPM DDR/BIMC bandwidth vote (RAM speed).
 
-Boot OrangeFox (or any recovery with adb root) temporarily and pull at least `persist`, `modemst1`, `modemst2`, `fsg`, `fsc` and `boot`, `dtbo`, `vbmeta`. They contain per-device calibration data. Keep them off git; `.gitignore` already excludes `backup/`, `dtb/` and `recovery/`.
+### 2026-11-09 — rendering fixed (sysmem), roadmap agreed with the owner (do in order)
+- r52/r53: glfetch=0 (eagl boot-arg) stops CoreAnimation using EXT_shader_framebuffer_fetch ("vcm" vibrant program NOT MADE on A4xx -> GL 0x502); lock screen gets its red gradient; GL errors 0.
+- r53 sysmem: boot-arg `glenv=FD_MESA_DEBUG=sysmem` (Mesa freedreno A4xx GMEM/tiling path is broken: speckles in glyphs, dock noise). With it: rendering clean, Settings opens. 0149/0150 (cache) did not fix it; keep them.
+- Frame cost (r53 sysmem log): ~27 ms/frame in GL (13 ms GL calls) but ~67 ms/frame "making textures of IOSurfaces": eagl shares a surface with the GPU only if GL_BGRA (surface_shared()), RGBA ones (icons 180x180) are copied; one 10 MB full-screen surface is refilled every frame (glTexImage2D 40 s total).
+- 0151: framebuffer double buffering (second panel buffer 0x90800000, MDP RGB0 SRC0_ADDR flip + CTL0 flush bit 3) for the visible top-to-bottom repaint.
 
-The shim needs the stock DTB. Unpack your phone's stock `boot.img`:
+**TODO list, in this order (owner: "hepsini sırayla yapacağız"):**
+1. Verify 0151 double buffering (r54) removes the top-to-bottom repaint.
+2. Make sysmem + glfetch=0 the defaults (Mesa env/eagl defaults instead of boot-args).
+3. Share RGBA IOSurfaces with the GPU too (texture swizzle; redwood_gl_surface_texture needs the format) -> rebuild libshamrock-gl (find how it is built).
+4. Find which full-screen surface is refilled every frame (10 MB/frame) and make it shared / stop the refill.
+5. MDP scanning the iOS surface directly with hardware scaling (bilinear 1242x2208 -> 1080x1920, zero CPU copy); boot-arg sweetfb_mdpscale=1; RGB0 may not scale (ios-river: VIG0 attempt gave blue) -> VIG pipe if needed.
+6. Wallpaper: HEIC->PNG in the root image now (owner's choice, ios-sailfish tools/wallpaper-heic2png.sh); AMFI service (0141) already in. LATER (owner: "sonra HEVC için çalışma yaparız"): VideoToolbox software HEVC decoder (VCPHEVC, HackiOS inject_media.c) for photos/videos; no hardware Venus driver (owner: overkill).
+7. Widgets "Waiting..." / app extensions, "press home to open" text, apps opening black (check with sysmem; Settings opens now).
+8. cpus=8 (second cluster PLL 0x0b116000), CPU clock policy.
+9. RAM (DDR/BIMC) speed: measure BIMC clock, vote bandwidth through RPM SMD (Linux qcom_smd-rpm / clk-smd-rpm).
+10. Fast log fetch via lk2nd ramoops region (0xbff80000) + `oem ramoops`/`upload` (check lk2nd source first: `oem ramoops raw` hung once).
+11. GPU SMMU done; later remove the surface/GPU pools if no longer needed.
 
-```sh
-python3 tools/unpack_bootv2.py backup/boot.img dtb/boot_unpacked   # -> dtb/boot_unpacked/dtb
-```
-
-### 1. Build the kernel
-
-The kernel builds on GitHub's macOS runners with [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build). The workflow fetches xnu-8796, applies `xnu/patches/` in order, and also stages the pinned open-source libpthread, HFS and BearSSL sources it needs. Fork the repo (public repos get free macOS minutes) and run:
-
-```sh
-gh workflow run xnu.yml -R YOU/ios-sweet
-gh run download RUN_ID -R YOU/ios-sweet -n xnu-kernel -D xnu/out
-```
-
-To check a patch locally before spending a CI run, `tools/xnu-cc.py` replays the compile commands of a previous CI log for single files.
-
-### 2. Build the iOS root image
-
-Download the iPhone X (iPhone10,3) iOS 16.7.16 (20H392) IPSW from Apple. Then, on Linux, with `apfs-fuse`, `hfsprogs` and sudo:
-
-```sh
-# OS, SystemOS and AppOS disk images from the IPSW (see BuildManifest.plist for their names)
-tools/mkiosroot.sh OS.dmg SystemOS.dmg AppOS.dmg ios16-root.img 16G
-sudo fsck.hfsplus -fy ios16-root.img
-sudo mount -t hfsplus -o loop,force ios16-root.img /mnt/iosroot
-sudo python3 tools/sweet-root-tweaks.py /mnt/iosroot
-sudo umount /mnt/iosroot
-img2simg ios16-root.img ios16-root.simg
-```
-
-`mkiosroot.sh` copies the OS volume and both cryptexes into one case-sensitive journaled HFS+ volume. It adds the dyld cache links, the plain system keybag and the log directories the daemons expect. `sweet-root-tweaks.py` applies the bring-up changes: it skips Setup, seeds the activation state, removes the baseband daemon, disables the watchdogs that kill slow apps and the crash-looping media paths, and so on. The script's header explains each change.
-
-The device tree builder copies `/product` from the real iPhone X device tree, which MobileGestalt needs. Extract it once, without downloading the whole IPSW:
-
-```sh
-python3 tools/remotezip.py IPSW_URL DeviceTree.d22ap.im4p research/ipsw-x/dt
-ipsw img4 im4p extract research/ipsw-x/dt/Firmware/all_flash/DeviceTree.d22ap.im4p -o research/ipsw-x/d22ap.adt
-```
-
-### 3. Build the boot image
-
-Needs `aarch64-linux-gnu-gcc` and `mkbootimg`.
-
-```sh
-python3 tools/mkadt.py shim/out/sweet.adt --highmem
-python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/sweet.adt shim/out/payload.bin \
-    --cmdline 'debug=0xc serial=3 cpus=6 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30'
-shim/build.sh ../shim/out/payload.bin      # -> shim/out/shim-boot.img
-```
-
-What the less obvious boot-args do:
-
-| Boot-arg | Effect |
-| --- | --- |
-| `rd=ufsroot0 ufsrw=1 rootrw=1` | Root on the `userdata` partition, writable |
-| `cpus=6` | Start the six A55 cores; `cpus=1` is the safe fallback |
-| `launchd_unsecure_cache=1` | launchd accepts its job cache without AMFI |
-| `wdt=-1 wdt_test=no_user_checkin` | No hardware watchdog |
-| `sweetfb_noconsole=1` | Stop drawing kernel text over the GUI. It still goes to the persistent log; panics are drawn |
-| `sweetfb_hz=30` | Panel refresh rate of the CPU copy |
-| `sweettouch=0`, `sweetkeys=0` | Disable the touch or button driver |
-
-### 4. Flash the root and boot
-
-```sh
-fastboot -S 512M flash userdata ios16-root.simg   # ~7 minutes; do not unplug
-# Xiaomi's fastboot often hangs after a large flash: re-enter fastboot with Power + Volume down
-fastboot boot shim/out/shim-boot.img
-```
-
-The first boot takes about 4–5 minutes on the Apple logo, then the lock screen appears. Swipe up to unlock. To get back to fastboot, hold Power + Volume down.
-
-### 5. Read the kernel log
-
-```sh
-fastboot boot recovery/recovery.img        # OrangeFox, temporary
-tools/sweet-log-pull.sh logs/boot.txt      # 4 MiB console ring from the end of userdata
-adb reboot bootloader
-```
-
-The log contains crash reports with backtraces (`CRASH name ...`), IOKit traces of backboardd and SpringBoard, and the drivers' `SWEET ...` lines. `tools/sweet-crash.py` symbolicates them against the shared cache.
-
-### QEMU
-
-`tools/qemu-sweet.py` boots the same kernel on QEMU `virt` with a test RAM-disk root. It is useful for kernel-only changes; see `NOTES.md`.
-
-## Repository layout
-
-| Path | What |
-| --- | --- |
-| `shim/` | Bare-metal boot shim (C + asm) packed as an Android boot.img v2 |
-| `xnu/patches/` | The XNU patch series (applied in order by CI), plus staging scripts for libpthread, HFS and BearSSL |
-| `.github/workflows/xnu.yml` | Kernel CI build |
-| `tools/mkadt.py` | Generates the Apple Device Tree from sweet's MMIO layout and the iPhone X identity |
-| `tools/mkpayload.py` | Packs kernel + ADT + boot-args into the shim payload |
-| `tools/mkiosroot.sh` | Builds the HFS+ iOS root from the IPSW images |
-| `tools/sweet-root-tweaks.py` | Bring-up changes to the root (Setup skip, activation, daemons) |
-| `tools/sweet-log-pull.sh`, `sweet-log.py` | Read the persistent kernel log from recovery |
-| `tools/sweet-crash.py` | Symbolicate console crash reports |
-| `tools/xnu-cc.py` | Local single-file compile check from a CI log |
-| `tools/qemu-sweet.py` | QEMU test boots with framebuffer text decoding |
-| `tools/adt.py`, `remotezip.py`, `unpack_bootv2.py`, `sparsediff.py` | Helpers |
-| `NOTES.md` | Detailed engineering log: every boot, crash and decision, plus hardware facts |
-
-Not in git: partition backups, live device trees, recovery images, Apple firmware and root images, and downloaded or generated build trees. They contain device serials and calibration data, or Apple's copyrighted files.
-
-## Kernel patches
-
-| # | What |
-| --- | --- |
-| 0001–0009 | Toolchain compatibility, SWEET machine config, non-PAC arm64, stubs for Apple-internal pieces |
-| 0010–0018 | Early framebuffer console, physmap fix, PRNG without corecrypto, device-tree platform expert, timer PPI, boot CPU driver |
-| 0019–0020 | Apple open-source libpthread kernel provider; BearSSL AES |
-| 0021–0027 | RAM-disk root, mockfs, SHA-256, minimal AMFI, Apple open-source HFS+, MD5 |
-| 0028–0034 | UFS host driver and root device, read/write root, DMA above 4 GiB |
-| 0035–0045 | Entitlements, bindfs, AppleKeyStore stub, IOWatchdog, console crash reports |
-| 0046 | IOSurface (IOCoreSurfaceRoot) and IOMobileFramebuffer (AppleCLCD) services |
-| 0047–0055 | Diagnostics: persistent log, /dev/null tee, IOKit trace, heap strings and user stack sampler on crash; permissive Sandbox policy; HFS rename-swap; AppleKeyStore selectors |
-| 0056–0057 | Throttled panel copy; no external identity resolver |
-| 0058 | HID event services. Apple's IOHIDFamily-1915.140.3 user client and event queue, matching the iOS 16.7 userland |
-| 0059 | iPhone X identity (`hw.product` / `hw.target` from the device tree) |
-| 0060 | Power and volume keys over SPMI; touch over GENI I²C |
-| 0061 | Present the display as 1125×2436 |
-| 0062 | RPMh regulator vote for the touch rail; battery power source |
-| 0063 | GENI FIFO packing fix and the Goodix GT9896 protocol |
-| 0064 | Grant PRIV_WORK_INTERVAL (UIKit's CoreAnimation work interval) |
-| 0065 | SMP: secondary A55 cores via PSCI CPU_ON |
-| 0066–0067 | Fault-region crash info; console mute |
-| 0068 | IOSurface lookup semantics for already-mapped surfaces |
-| 0069 | Batched persistent-log flushes |
-
-## Key hardware facts
-
-- RAM: payloads use the upper bank, `0x100000000` + `0xfcc00000` (about 3.95 GiB), above Qualcomm's protected carve-outs.
-- GICv3 with security extensions: the timer goes through Group 1 IRQ (virtual timer INTID 19), not FIQ as on Apple silicon.
-- PSCI through `smc`, 19.2 MHz timer, ARMv8.2 without pointer authentication. MPIDR uses Aff1 for the core number.
-- Panel: 1080×2400 DSC video mode, continuous splash from ABL, no refresh kick needed.
-- Touch: Goodix GT9896 at I²C `0x5d` on QUP SE7 (`0xa84000`), powered by PM6150L LDO11 through RPMh.
-- Buttons: power and volume down on the PM6150 PON block, volume up on PM6150L GPIO2 (SPMI SID 4).
-
-More in [`NOTES.md`](NOTES.md).
-
-## Credits
-
-Built on Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build), [ipsw](https://github.com/blacktop/ipsw), Qualcomm/Xiaomi's published Linux kernel sources for the hardware details, and [OrangeFox Recovery](https://orangefox.download). iOS itself is Apple's and is not distributed here.
+### 2026-11-10 — fresh /var boot stall: root cause (0157 user stacks) and fix (0158)
+- After the full userdata flash (wallpaper PNGs + 32 staged apps moved to /Applications), every boot stayed at the Apple logo; the phone stayed cold. Same with the AMFI service off, the GPU off, and containermanagerd injected (0156).
+- 0157 adds process names and user stacks (SpringBoard, backboardd, containermanagerd, lsd, installd, data migrator) to the stall dump. Symbolized with `work/tools/dscsym.py` (dyld shared cache copied to work/dsc; slide found from trap PCs + return addresses, 0x342d0000 in r60):
+  SpringBoard main thread: `+[SpringBoard initializeSystemServicesBeforeApplicationDidFinishLaunching]` -> CCSModuleRepository -> LSApplicationRecord -> LSContext lock; another thread in `__LAUNCH_SERVICES_IS_RESEEDING_ITS_DATABASE_AND_MAY_BLOCK__`.
+  lsd: seeding scans /Applications -> MIContainer -> containermanagerd (sync XPC).
+  containermanagerd: `read()` -> hfs_vnop_read -> cluster_io -> `sweet_emmc_strategy` -> `lck_mtx_lock_contended(sweet_emmc_lock)`.
+  eMMC reads (ADMA2, ~70 MB/s) stop at ~200 s. Writes were PIO: one CMD24 + CMD13 polling per 512 bytes, device lock held for the whole buffer. A fresh /var writes a lot on the first boot (the Nov 7 first boot took ~14 h).
+- 0158: ADMA2 multi-block writes (CMD25 + auto CMD12, 1 MiB bounce), lock dropped between chunks, read-back verify of every DMA write (sweetemmcverify=0 to skip; mismatch -> PIO rewrite and DMA writes off), sweetemmcdmaw=0 for PIO. Logs `SWEET EMMC: N MiB written, X KiB/s, M MiB verified`.
+- Consequence: reverting to the previous root would NOT have helped (any full flash resets /var).
+- TODO (GPU): GMEM. Kernel GET_PARAM values (GMEM 256 KB, chip 0x04000500) match Linux; compare Linux a4xx_hw_init with SweetAdreno, or check pmOS on this phone renders with GMEM.
