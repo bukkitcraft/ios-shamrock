@@ -1,0 +1,175 @@
+diff --git c/bsd/dev/sweet_emmc.c i/bsd/dev/sweet_emmc.c
+index c59266f..6e62e4d 100644
+--- c/bsd/dev/sweet_emmc.c
++++ i/bsd/dev/sweet_emmc.c
+@@ -47,7 +47,11 @@ static struct {
+ 	vm_offset_t dma;                   /* kernel VA of the DMA allocation (ADMA2 table + bounce) */
+ 	uint64_t dma_pa;
+ 	bool dma_ok;
++	bool dma_wr_ok;                    /* shamrock: ADMA2 multi-block writes (boot-arg sweetemmcdmaw=0: PIO) */
++	bool dma_wr_verify;                /* read every DMA write back (boot-arg sweetemmcverify=0: off) */
++	uint64_t stat_wverified;
+ 	uint64_t stat_bytes, stat_ticks, stat_next;   /* ADMA read throughput */
++	uint64_t stat_wbytes, stat_wticks, stat_wnext, stat_wpio, stat_wpnext;        /* writes */
+ } se;
+ 
+ #define DMA_TABLE       0x0000          /* ADMA2 descriptors, 16 x 8 bytes used */
+@@ -447,6 +451,81 @@ emmc_dma_read(uint32_t lba, uint32_t count)
+ 	return 0;
+ }
+ 
++/*
++ * shamrock: multi-block write (CMD25) with ADMA2 from the bounce buffer, then CMD13 until the card is
++ * back in tran. The PIO write (one CMD24 + CMD13 polling per 512 bytes) held the device lock for
++ * minutes on a fresh /var: the first boot writes a lot, every read queued behind it and SpringBoard
++ * waited on LaunchServices (lsd -> containermanagerd -> read -> sweet_emmc_lock) for good.
++ */
++static int
++emmc_dma_write(uint32_t lba, uint32_t count)
++{
++	struct { uint16_t attr; uint16_t len; uint32_t addr; } *d = (void *)(se.dma + DMA_TABLE);
++	uint32_t bytes = count * 512, n = 0, off = 0;
++	uint64_t t0;
++
++	while (off < bytes) {
++		uint32_t l = MIN(bytes - off, 0x10000u);
++		d[n].attr = 0x21;
++		d[n].len = (uint16_t)l;
++		d[n].addr = (uint32_t)(se.dma_pa + DMA_BOUNCE + off);
++		off += l;
++		n++;
++	}
++	d[n - 1].attr = 0x23;
++	flush_dcache64((addr64_t)(se.dma_pa + DMA_TABLE), n * 8, TRUE);
++	flush_dcache64((addr64_t)(se.dma_pa + DMA_BOUNCE), bytes, TRUE);
++
++	t0 = mach_absolute_time();
++	hw(0x2c, hr(0x2c) | (0x06u << 24));
++	while (((hr(0x2c) >> 24) & 6) && !timed_out(t0, 100000)) {
++	}
++	t0 = mach_absolute_time();
++	while (hr(0x24) & 3) {
++		if (timed_out(t0, 100000)) {
++			return -1;
++		}
++	}
++	hw(0x34, 0x0000ffff);
++	hw(0x30, 0xffffffff);
++	hw(0x28, (hr(0x28) & ~0x18u) | 0x10);   /* DMA select: ADMA2 32-bit */
++	hw(0x58, (uint32_t)(se.dma_pa + DMA_TABLE));
++	hw(0x5c, (uint32_t)((se.dma_pa + DMA_TABLE) >> 32));
++	hw(0x04, (count << 16) | 512 | (7 << 12));
++	hw(0x08, lba);
++	/* CMD25, R1; transfer mode: DMA | block count | auto CMD12 | write | multi block */
++	hw(0x0c, (((25u << 8) | 0x3a) << 16) | 0x0027);
++	t0 = mach_absolute_time();
++	for (;;) {
++		uint32_t st = hr(0x30);
++		if (st & 0x8000) {
++			last_int = st;
++			cmd_reset();
++			return -2;
++		}
++		if (st & 2) {
++			break;
++		}
++		if (timed_out(t0, 5000000)) {
++			last_int = st;
++			cmd_reset();
++			return -3;
++		}
++	}
++	hw(0x30, 0xffffffff);
++	t0 = mach_absolute_time();
++	for (;;) {
++		uint32_t r = 0;
++		if (send_cmd(13, 1u << 16, 0x1a, &r) == 0 && (r & 0x100) && (((r >> 9) & 0xf) == 4)) {
++			break;
++		}
++		if (timed_out(t0, 5000000)) {
++			return -4;
++		}
++	}
++	return 0;
++}
++
+ static int
+ emmc_read_sectors(uint64_t lba, uint32_t count, void *dst)
+ {
+@@ -550,8 +629,13 @@ sweet_emmc_strategy(buf_t bp)
+ 		error = EIO;
+ 		goto done;
+ 	}
+-	lck_mtx_lock(&sweet_emmc_lock);
++	bool locked = false;
+ 	for (uint32_t done = 0; done < count;) {
++		if (locked) {
++			lck_mtx_unlock(&sweet_emmc_lock);       /* let other I/O in between chunks */
++		}
++		lck_mtx_lock(&sweet_emmc_lock);
++		locked = true;
+ 		uint64_t pos = off + done;
+ 		uint64_t lba = pos / 512;
+ 		uint32_t skip = (uint32_t)(pos % 512);
+@@ -581,6 +665,47 @@ sweet_emmc_strategy(buf_t bp)
+ 			buf_setresid(bp, count - done);
+ 			continue;
+ 		}
++		if (!is_read && se.dma_ok && se.dma_wr_ok && skip == 0 && count - done >= 512) {
++			uint32_t w = MIN(count - done, DMA_BYTES) & ~511u;
++			uint64_t ts = mach_absolute_time();
++			memcpy((char *)(se.dma + DMA_BOUNCE), vaddr + done, w);
++			error = emmc_dma_write((uint32_t)(se.first_block + lba), w / 512);
++			se.stat_wticks += mach_absolute_time() - ts;
++			if (error) {
++				printf("SWEET EMMC: ADMA write failed (%d, int 0x%x), using PIO writes\n", error, last_int);
++				se.dma_wr_ok = false;
++				error = 0;
++				continue;
++			}
++			if (se.dma_wr_verify) {
++				/* read it back and compare; on a mismatch rewrite this chunk by PIO and stop using DMA writes */
++				int e2 = emmc_dma_read((uint32_t)(se.first_block + lba), w / 512);
++				if (e2 || memcmp((char *)(se.dma + DMA_BOUNCE), vaddr + done, w) != 0) {
++					printf("SWEET EMMC: ADMA write verify FAILED at lba %llu (%u bytes, read %d), PIO writes from now\n",
++					    se.first_block + lba, w, e2);
++					se.dma_wr_ok = false;
++					continue;
++				}
++				se.stat_wverified += w;
++			}
++			se.stat_wbytes += w;
++			if (se.stat_wbytes >= se.stat_wnext) {
++				uint64_t us = se.stat_wticks * 10ULL / 192ULL;
++				printf("SWEET EMMC: %llu MiB written, %llu KiB/s avg while writing, %llu MiB verified\n", se.stat_wbytes >> 20,
++				    us ? (se.stat_wbytes * 1000000ULL / us) >> 10 : 0, se.stat_wverified >> 20);
++				se.stat_wnext = se.stat_wbytes + (16ULL << 20);
++			}
++			done += w;
++			buf_setresid(bp, count - done);
++			continue;
++		}
++		if (!is_read) {
++			se.stat_wpio += want;
++			if (se.stat_wpio >= se.stat_wpnext) {
++				printf("SWEET EMMC: %llu KiB written by PIO\n", se.stat_wpio >> 10);
++				se.stat_wpnext = se.stat_wpio + (1ULL << 20);
++			}
++		}
+ 		if (is_read) {
+ 			if (skip == 0 && want == 512) {
+ 				error = emmc_read_sectors(se.first_block + lba, 1, vaddr + done);
+@@ -721,6 +846,13 @@ sweet_emmc_init(void)
+ 		if (pn && !nodma) {
+ 			se.dma_pa = ptoa_64(pn);
+ 			se.dma_ok = true;
++			uint32_t dmaw = 1;
++			PE_parse_boot_argn("sweetemmcdmaw", &dmaw, sizeof(dmaw));
++			se.dma_wr_ok = dmaw != 0;
++			uint32_t verify = 1;
++			PE_parse_boot_argn("sweetemmcverify", &verify, sizeof(verify));
++			se.dma_wr_verify = verify != 0;
++			printf("SWEET EMMC: ADMA2 writes %s, verify %s\n", se.dma_wr_ok ? "on" : "off", se.dma_wr_verify ? "on" : "off");
+ 		}
+ 	}
+ 	lck_mtx_lock(&sweet_emmc_lock);
