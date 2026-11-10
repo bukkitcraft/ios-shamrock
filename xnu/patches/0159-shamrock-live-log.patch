@@ -1,0 +1,174 @@
+diff --git c/iokit/Kernel/arm/SweetPlatformExpert.cpp i/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 3a5165b..236aeb6 100644
+--- c/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ i/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -37,9 +37,7 @@ SweetPlatformExpert::start(IOService *provider)
+ 		/* shamrock: boot-arg sweetstall=<seconds> dumps all thread states to RAM and resets via the watchdog */
+ 		uint32_t stall = 0;
+ 		(void)PE_parse_boot_argn("sweetstall", &stall, sizeof(stall));
+-		if (stall) {
+-			sweet_stall_arm(stall);
+-		}
++		sweet_stall_arm(stall);         /* also starts the live log (sweetlivelog=0: off) */
+ 	}
+ 	return true;
+ }
+diff --git c/osfmk/arm64/sweet_stall.c i/osfmk/arm64/sweet_stall.c
+index fbe73e1..fc1b577 100644
+--- c/osfmk/arm64/sweet_stall.c
++++ i/osfmk/arm64/sweet_stall.c
+@@ -142,6 +142,94 @@ stall_user_stacks(void)
+ 	s_nuser = 0;
+ }
+ 
++/*
++ * shamrock live log: every 3 s the tail of the kernel message buffer is copied into the same RAM
++ * region (SWEETDUMP header, "LIVE" line, last 96 KB of MSGBUF, END), so any boot can be read from lk2nd after a
++ * reset (readdump.sh), without a separate log image. Off with sweetlivelog=0. The stall dump takes
++ * the region over for good when it fires.
++ */
++static volatile int s_region_busy;
++static volatile bool s_fired;
++
++static void
++s_region_take(void)
++{
++	while (!__sync_bool_compare_and_swap(&s_region_busy, 0, 1)) {
++	}
++}
++
++static void
++s_region_give(void)
++{
++	__sync_lock_release(&s_region_busy);
++}
++
++static void
++s_msgbuf_tail(int max)
++{
++	if (msgbufp && msgbufp->msg_magic == MSG_MAGIC && msgbufp->msg_bufc && msgbufp->msg_size > 0) {
++		int size = msgbufp->msg_size;
++		int n = size < max ? size : max;
++		int x = msgbufp->msg_bufx;
++		s_s("MSGBUF\n");
++		for (int i = n; i > 0; i--) {
++			int idx = (x - i) % size;
++			if (idx < 0) {
++				idx += size;
++			}
++			char c = msgbufp->msg_bufc[idx];
++			if (c == '\n' || (c >= 0x20 && c < 0x7f)) {
++				s_c(c);
++			}
++		}
++		s_s("\n");
++	}
++}
++
++static void
++s_finish(void)
++{
++	s_s("END\n");
++	const char *m = "SWEETDUMP";
++	for (int i = 0; i < 9; i++) {
++		sbuf[i] = m[i];
++	}
++	*(volatile uint32_t *)(sbuf + 12) = spos;
++	__builtin_arm_dsb(DSB_SY);
++}
++
++static thread_call_t s_live_call;
++static vm_offset_t s_live_va;
++
++static void
++sweet_live_fire(thread_call_param_t p0, thread_call_param_t p1)
++{
++#pragma unused(p0, p1)
++	if (s_fired) {
++		return;
++	}
++	if (!s_live_va) {
++		s_live_va = ml_io_map(STALL_PA, STALL_SIZE);
++		if (!s_live_va) {
++			return;
++		}
++	}
++	s_region_take();
++	if (!s_fired) {
++		sbuf = (char *)s_live_va;
++		spos = 0;
++		s_s("LIVE now=");
++		s_x(mach_absolute_time());
++		s_c('\n');
++		s_msgbuf_tail(96 * 1024);     /* ~10 ms of uncached byte stores every 3 s */
++		s_finish();
++	}
++	s_region_give();
++	uint64_t deadline;
++	nanoseconds_to_deadline(3ULL * NSEC_PER_SEC, &deadline);
++	thread_call_enter_delayed(s_live_call, deadline);
++}
++
+ static void
+ sweet_stall_fire(thread_call_param_t p0, thread_call_param_t p1)
+ {
+@@ -150,6 +238,9 @@ sweet_stall_fire(thread_call_param_t p0, thread_call_param_t p1)
+ 	if (!va) {
+ 		return;
+ 	}
++	s_region_take();
++	s_fired = true;
++	s_region_give();
+ 	sbuf = (char *)va;
+ 	spos = 0;
+ 	s_s("T now=");
+@@ -202,31 +293,9 @@ sweet_stall_fire(thread_call_param_t p0, thread_call_param_t p1)
+ 		lck_mtx_unlock(&tasks_threads_lock);
+ 	}
+ 	stall_user_stacks();
+-	/* tail of the kernel message buffer (printf/IOLog/hfs messages): msg_bufx is the write pointer of a ring */
+-	if (msgbufp && msgbufp->msg_magic == MSG_MAGIC && msgbufp->msg_bufc && msgbufp->msg_size > 0) {
+-		int size = msgbufp->msg_size;
+-		int n = size < 100000 ? size : 100000;
+-		int x = msgbufp->msg_bufx;
+-		s_s("MSGBUF\n");
+-		for (int i = n; i > 0; i--) {
+-			int idx = (x - i) % size;
+-			if (idx < 0) {
+-				idx += size;
+-			}
+-			char c = msgbufp->msg_bufc[idx];
+-			if (c == '\n' || (c >= 0x20 && c < 0x7f)) {
+-				s_c(c);
+-			}
+-		}
+-		s_s("\n");
+-	}
+-	s_s("END\n");
+-	const char *m = "SWEETDUMP";
+-	for (int i = 0; i < 9; i++) {
+-		sbuf[i] = m[i];
+-	}
+-	*(volatile uint32_t *)(sbuf + 12) = spos;
+-	__builtin_arm_dsb(DSB_SY);
++	/* tail of the kernel message buffer (printf/IOLog/hfs messages) */
++	s_msgbuf_tail(100000);
++	s_finish();
+ 
+ 	/* APSS watchdog bite after ~2 s (qcom,kpss-wdt: RST 0x04, EN 0x08, BARK 0x10, BITE 0x14, 32.768 kHz) */
+ 	volatile uint32_t *w = (volatile uint32_t *)ml_io_map(STALL_WDT, 0x1000);
+@@ -264,7 +333,13 @@ sweet_stall_arm(uint32_t seconds)
+ 	}
+ 	static thread_call_t call;
+ 	uint64_t deadline;
+-
++	uint32_t live = 1;
++	PE_parse_boot_argn("sweetlivelog", &live, sizeof(live));
++	if (live && !s_live_call) {
++		s_live_call = thread_call_allocate(sweet_live_fire, NULL);
++		nanoseconds_to_deadline(2ULL * NSEC_PER_SEC, &deadline);
++		thread_call_enter_delayed(s_live_call, deadline);
++	}
+ 	if (!seconds || call) {
+ 		return;
+ 	}
