@@ -1,0 +1,100 @@
+diff --git c/iokit/Kernel/arm/SweetFramebuffer.cpp i/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 1b50429..67e27a8 100644
+--- c/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ i/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -67,6 +67,9 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #define SWEET_MDP_TOP_PA        0x01a01000ULL   /* SMP_ALLOC_W 0x80, SMP_ALLOC_R 0x130 */
+ #define SWEET_MDP_VIG0_PA       0x01a05000ULL   /* MDP base + 0x4000 */
+ #define SWEET_MDP_LM0_PA        0x01a45000ULL   /* MDP base + 0x44000: BORDER_COLOR_0 +0x08, _1 +0x10 */
++#define SWEET_MDP_INTF1_PAGE    0x01a6b000ULL   /* INTF1 (DSI) = MDP base + 0x6a800 (Linux mdp5_cfg msm8x52): */
++#define SWEET_INTF1_FRAME_COUNT ((0x800 + 0xac) / 4)    /* frames scanned out */
++#define SWEET_INTF1_LINE_COUNT  ((0x800 + 0xb0) / 4)    /* line being scanned out now */
+ #define SWEET_MDP_LAYER0        0x00            /* CTL0 */
+ #define SWEET_FLUSH_VIG0        (1u << 0)
+ #define SWEET_FLUSH_RGB0        (1u << 3)
+@@ -201,6 +204,11 @@ public:
+ 	IOMemoryMap  *fBuf1Map;
+ 	volatile uint32_t *fTop;        /* MDP top (SMP); NULL: no VIG0 scanout */
+ 	volatile uint32_t *fLM0;        /* shamrock: layer mixer 0 (border colour), may be NULL */
++	volatile uint32_t *fINTF;       /* shamrock: INTF1 page (frame and line counters), may be NULL */
++	uint32_t      fLastPanelFrame, fPanelLines, fVsyncLock;
++	uint32_t      fFrameDelta[4];         /* panel frames between two ticks: 0, 1, 2, more (5 s window) */
++	int64_t       fLineSum;               /* line at the tick, summed over the window */
++	uint32_t      fLineN;
+ 	volatile uint32_t *fVIG0;
+ 	bool          fVigSetUp, fVigOn;
+ 	SweetSurface *fScanned[2];      /* [0] shown by VIG0 now, [1] flushed to be shown next */
+@@ -341,6 +349,9 @@ AppleCLCD::start(IOService *provider)
+ 				fTop = (volatile uint32_t *)ml_io_map((vm_offset_t)SWEET_MDP_TOP_PA, 0x1000);
+ 				fVIG0 = (volatile uint32_t *)ml_io_map((vm_offset_t)SWEET_MDP_VIG0_PA, 0x1000);
+ 				fLM0 = (volatile uint32_t *)ml_io_map((vm_offset_t)SWEET_MDP_LM0_PA, 0x1000);
++				fINTF = (volatile uint32_t *)ml_io_map((vm_offset_t)SWEET_MDP_INTF1_PAGE, 0x1000);
++				fVsyncLock = 1;
++				PE_parse_boot_argn("sweetfb_vsynclock", &fVsyncLock, sizeof(fVsyncLock));
+ 				if (fTop == NULL || fVIG0 == NULL) {
+ 					fTop = NULL;
+ 					fVIG0 = NULL;
+@@ -381,6 +392,41 @@ AppleCLCD::start(IOService *provider)
+ 	return true;
+ }
+ 
++/*
++ * shamrock: the vsync notifications came from a free-running 16.667 ms timer, not from the panel: the
++ * two drift apart, so a frame stayed on screen for one or two refreshes at random (judder) and
++ * CoreAnimation paced its animations on an uneven clock. Each tick now reads INTF1's line counter and
++ * aims the next tick at the start of the panel's next frame (sweetfb_vsynclock=0: free-running).
++ * The 5 s status reports how many panel frames passed between ticks (ideal: always 1).
++ */
++static uint32_t
++sweet_next_vsync_us(AppleCLCD *fb)
++{
++	if (fb->fINTF == NULL) {
++		return SWEET_FB_VSYNC_US;
++	}
++	uint32_t frame = fb->fINTF[SWEET_INTF1_FRAME_COUNT], line = fb->fINTF[SWEET_INTF1_LINE_COUNT] & 0xffff;
++	uint32_t delta = frame - fb->fLastPanelFrame;
++	fb->fLastPanelFrame = frame;
++	fb->fFrameDelta[delta < 3 ? delta : 3]++;
++	if (line > fb->fPanelLines) {
++		fb->fPanelLines = line;         /* (the largest line seen: lines per frame incl. porches) */
++	}
++	fb->fLineSum += line;
++	fb->fLineN++;
++	if (!fb->fVsyncLock || fb->fPanelLines < 1000) {
++		return SWEET_FB_VSYNC_US;
++	}
++	/* time left until the panel's next frame starts, plus a few lines into it */
++	uint32_t total = fb->fPanelLines + 1, target = 8;
++	int32_t lines_left = (int32_t)(total - line) + (int32_t)target;
++	uint32_t us = (uint32_t)((uint64_t)lines_left * SWEET_FB_VSYNC_US / total);
++	if (us < SWEET_FB_VSYNC_US / 2) {
++		us += SWEET_FB_VSYNC_US;        /* just past the start already: the frame after */
++	}
++	return us;
++}
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -460,6 +506,12 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		    "layer0 %#x, dirty %d, off %d, vig %d\n", fb->fStatSwaps, fb->fVigFrames, fb->fCpuFrames, fb->fFlipBusy,
+ 		    fb->fBusyForced, fb->fGpuNotDone, fb->fMDP ? fb->fMDP[SWEET_MDP_CTL0_FLUSH / 4] : 0, fb->fMDP ? fb->fMDP[SWEET_MDP_LAYER0 / 4] : 0,
+ 		    fb->fDirty, fb->fPowerOff, fb->fVigOn);
++		IOLog("SWEET FB: 5 s: panel frames per tick 0:%u 1:%u 2:%u 3+:%u, mean line at tick %lld of %u, lock %u\n",
++		    fb->fFrameDelta[0], fb->fFrameDelta[1], fb->fFrameDelta[2], fb->fFrameDelta[3],
++		    fb->fLineN ? fb->fLineSum / fb->fLineN : 0, fb->fPanelLines, fb->fVsyncLock);
++		bzero(fb->fFrameDelta, sizeof(fb->fFrameDelta));
++		fb->fLineSum = 0;
++		fb->fLineN = 0;
+ 	}
+ 	uint8_t *rec = NULL;
+ 	if (flush) {
+@@ -474,7 +526,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	sender->setTimeoutUS(sweet_next_vsync_us(fb));
+ }
+ 
+ void
