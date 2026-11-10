@@ -1,0 +1,92 @@
+diff --git c/iokit/Kernel/arm/SweetPlatformExpert.cpp i/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 236aeb6..d57aa56 100644
+--- c/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ i/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -11,6 +11,7 @@
+ #include <IOKit/IOLib.h>
+ 
+ extern "C" void sweet_stall_arm(uint32_t seconds);
++extern "C" void sweet_wdt_reset(void);
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -20,6 +21,7 @@ public:
+ 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
++	int haltRestart(unsigned int type) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+@@ -42,6 +44,24 @@ SweetPlatformExpert::start(IOService *provider)
+ 	return true;
+ }
+ 
++/*
++ * shamrock: iOS halt / restart (slide to power off, reboot(2) from launchd) never ended: the phone sat
++ * on the shutdown spinner. Both now reset through the watchdog into lk2nd.
++ */
++int
++SweetPlatformExpert::haltRestart(unsigned int type)
++{
++	if (type != kPEHaltCPU && type != kPERestartCPU && type != kPEUPSDelayHaltCPU) {
++		return IODTPlatformExpert::haltRestart(type);   /* panic, paging off, ...: unchanged */
++	}
++	IOLog("SWEET: haltRestart(%u): resetting into lk2nd\n", type);
++	sweet_wdt_reset();
++	for (;;) {
++		__builtin_arm_wfe();
++	}
++	return 0;
++}
++
+ const char *
+ SweetPlatformExpert::deleteList(void)
+ {
+diff --git c/osfmk/arm64/sweet_stall.c i/osfmk/arm64/sweet_stall.c
+index fc1b577..76caa6b 100644
+--- c/osfmk/arm64/sweet_stall.c
++++ i/osfmk/arm64/sweet_stall.c
+@@ -309,6 +309,42 @@ sweet_stall_fire(thread_call_param_t p0, thread_call_param_t p1)
+ 	}
+ }
+ 
++/*
++ * shamrock: halt / restart from iOS (launchd's reboot(2) after "slide to power off"): one last live
++ * log snapshot, then an APSS watchdog bite in ~30 ms. The phone comes back in lk2nd (no PMIC power
++ * off yet); the log of the session can still be read there.
++ */
++void sweet_wdt_reset(void);
++void
++sweet_wdt_reset(void)
++{
++	if (!s_fired) {
++		if (!s_live_va) {
++			s_live_va = ml_io_map(STALL_PA, STALL_SIZE);
++		}
++		if (s_live_va && __sync_bool_compare_and_swap(&s_region_busy, 0, 1)) {
++			sbuf = (char *)s_live_va;
++			spos = 0;
++			s_s("LIVE (halt/restart) now=");
++			s_x(mach_absolute_time());
++			s_c('\n');
++			s_msgbuf_tail(96 * 1024);
++			s_finish();
++			s_fired = true;
++			s_region_give();
++		}
++	}
++	volatile uint32_t *w = (volatile uint32_t *)ml_io_map(STALL_WDT, 0x1000);
++	if (w) {
++		w[2] = 0;
++		w[1] = 1;
++		w[4] = 1000;
++		w[5] = 1000;            /* bite after ~30 ms at 32.768 kHz */
++		w[2] = 1;
++		__builtin_arm_dsb(DSB_SY);
++	}
++}
++
+ /* CPU speed probe: a 3-instruction loop (add, subs, b.ne) timed with the 19.2 MHz architected counter.
+  * ~1 iteration per cycle on a Cortex-A53, so iterations/us is roughly the core clock in MHz. */
+ static void
