@@ -1,0 +1,24 @@
+diff --git c/iokit/DriverKit/IORPC.h i/iokit/DriverKit/IORPC.h
+index 3ded78c..7175fbc 100644
+--- c/iokit/DriverKit/IORPC.h
++++ i/iokit/DriverKit/IORPC.h
+@@ -224,6 +224,7 @@ struct IORPC {
+ 	IORPCMessageMach * reply;
+ 	uint32_t           sendSize;
+ 	uint32_t           replySize;
++	IORPCMessage     * kernelContent;   /* shamrock: newer iig (Xcode 26) sets and reads it; NULL from this xnu's own callers */
+ };
+ typedef struct IORPC IORPC;
+ 
+diff --git c/iokit/IOKit/IORPC.h i/iokit/IOKit/IORPC.h
+index 3ded78c..7175fbc 100644
+--- c/iokit/IOKit/IORPC.h
++++ i/iokit/IOKit/IORPC.h
+@@ -224,6 +224,7 @@ struct IORPC {
+ 	IORPCMessageMach * reply;
+ 	uint32_t           sendSize;
+ 	uint32_t           replySize;
++	IORPCMessage     * kernelContent;   /* shamrock: newer iig (Xcode 26) sets and reads it; NULL from this xnu's own callers */
+ };
+ typedef struct IORPC IORPC;
+ 
