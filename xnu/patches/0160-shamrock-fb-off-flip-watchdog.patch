@@ -1,0 +1,82 @@
+diff --git c/bsd/dev/sweet_emmc.c i/bsd/dev/sweet_emmc.c
+index 6e62e4d..759374c 100644
+--- c/bsd/dev/sweet_emmc.c
++++ i/bsd/dev/sweet_emmc.c
+@@ -48,7 +48,7 @@ static struct {
+ 	uint64_t dma_pa;
+ 	bool dma_ok;
+ 	bool dma_wr_ok;                    /* shamrock: ADMA2 multi-block writes (boot-arg sweetemmcdmaw=0: PIO) */
+-	bool dma_wr_verify;                /* read every DMA write back (boot-arg sweetemmcverify=0: off) */
++	bool dma_wr_verify;                /* read every DMA write back (boot-arg sweetemmcverify=1: on) */
+ 	uint64_t stat_wverified;
+ 	uint64_t stat_bytes, stat_ticks, stat_next;   /* ADMA read throughput */
+ 	uint64_t stat_wbytes, stat_wticks, stat_wnext, stat_wpio, stat_wpnext;        /* writes */
+@@ -849,7 +849,7 @@ sweet_emmc_init(void)
+ 			uint32_t dmaw = 1;
+ 			PE_parse_boot_argn("sweetemmcdmaw", &dmaw, sizeof(dmaw));
+ 			se.dma_wr_ok = dmaw != 0;
+-			uint32_t verify = 1;
++			uint32_t verify = 0;    /* r62: 386 MiB written by ADMA2 on a first boot, all verified */
+ 			PE_parse_boot_argn("sweetemmcverify", &verify, sizeof(verify));
+ 			se.dma_wr_verify = verify != 0;
+ 			printf("SWEET EMMC: ADMA2 writes %s, verify %s\n", se.dma_wr_ok ? "on" : "off", se.dma_wr_verify ? "on" : "off");
+diff --git c/iokit/Kernel/arm/SweetFramebuffer.cpp i/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 2a0a5b9..7f48126 100644
+--- c/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ i/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -153,6 +153,8 @@ public:
+ 	bool          fVigSetUp, fVigOn;
+ 	SweetSurface *fScanned[2];      /* [0] shown by VIG0 now, [1] flushed to be shown next */
+ 	uint32_t      fVigFrames, fCpuFrames, fFlipBusy;
++	uint32_t      fBusyRun, fBusyForced;  /* shamrock: ticks in a row with a flip pending; flips pushed through anyway */
++	uint64_t      fStatSwaps, fStatTicks; /* 5 s status line */
+ 	uint32_t      fNotVig[5];       /* why not VIG0: layers, surface kind/size/format, memory not contiguous, other */
+ 	uint32_t      fNotVigLayers, fNotVigW, fNotVigH, fNotVigFmt;  /* the last one seen */
+ 	bool presentMDP(const uint8_t *rec);
+@@ -336,6 +338,14 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
++	if (fb->fPowerOff && fb->fVigOn && fb->fMDP != NULL) {
++		/* shamrock: the panel shows VIG0's surface, not fPixels: fading fPixels froze the last frame on screen */
++		fb->fMDP[SWEET_MDP_LAYER0 / 4] = 0;             /* no pipe on the mixer: border colour (black) */
++		fb->fVigOn = false;                             /* presentMDP() stages VIG0 again when on */
++		fb->fMDP[SWEET_MDP_CTL0_FLUSH / 4] = fb->fMDP[SWEET_MDP_CTL0_FLUSH / 4] | SWEET_FLUSH_VIG0 | SWEET_FLUSH_RGB0 |
++		    SWEET_FLUSH_LM0 | SWEET_FLUSH_CTL;
++		IOLog("SWEET FB: display off: VIG0 off the mixer\n");
++	}
+ 	if (fb->fPowerOff) {
+ 		/* Fade out: halve every channel each vsync, then black, then idle. */
+ 		uint32_t step = fb->fFadeStep;
+@@ -362,8 +372,21 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	 * (the frame stays dirty for the next one), nothing waits.
+ 	 */
+ 	if (flush && fb->fMDP != NULL && (fb->fMDP[SWEET_MDP_CTL0_FLUSH / 4] & SWEET_FLUSH_ALL) != 0) {
+-		flush = false;
+-		fb->fFlipBusy++;
++		if (++fb->fBusyRun <= 3) {
++			flush = false;
++			fb->fFlipBusy++;
++		} else {
++			fb->fBusyForced++;              /* pending for 3 ticks: the flush bit did not clear; go on anyway */
++			fb->fBusyRun = 0;
++		}
++	} else if (flush) {
++		fb->fBusyRun = 0;
++	}
++	if ((++fb->fStatTicks % (5000000 / SWEET_FB_VSYNC_US)) == 0) {
++		IOLog("SWEET FB: 5 s: %llu swaps in all, %u VIG0 / %u CPU frames, %u ticks skipped, %u forced, flush %#x, "
++		    "layer0 %#x, dirty %d, off %d, vig %d\n", fb->fStatSwaps, fb->fVigFrames, fb->fCpuFrames, fb->fFlipBusy,
++		    fb->fBusyForced, fb->fMDP ? fb->fMDP[SWEET_MDP_CTL0_FLUSH / 4] : 0, fb->fMDP ? fb->fMDP[SWEET_MDP_LAYER0 / 4] : 0,
++		    fb->fDirty, fb->fPowerOff, fb->fVigOn);
+ 	}
+ 	uint8_t *rec = NULL;
+ 	if (flush) {
+@@ -424,6 +447,7 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
++	fStatSwaps++;
+ 	IOLockUnlock(fLock);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
