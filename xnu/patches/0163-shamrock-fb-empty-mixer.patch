@@ -1,0 +1,24 @@
+diff --git c/iokit/Kernel/arm/SweetFramebuffer.cpp i/iokit/Kernel/arm/SweetFramebuffer.cpp
+index fdfa5fb..43816a2 100644
+--- c/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ i/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -83,6 +83,9 @@ static inline uint32_t
+ sweet_flush_pending(volatile uint32_t *ctl)
+ {
+ 	uint32_t layer = ctl[SWEET_MDP_LAYER0 / 4], mask = SWEET_FLUSH_LM0 | SWEET_FLUSH_CTL;
++	if (layer == 0) {
++		return 0;       /* r64: with nothing staged LM0's bit does not clear either (flush 0x49 for good) */
++	}
+ 	if (layer & 0x7u) {
+ 		mask |= SWEET_FLUSH_VIG0;
+ 	}
+@@ -367,8 +370,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		}
+ 		fb->fMDP[SWEET_MDP_LAYER0 / 4] = 0;             /* no pipe on the mixer: border colour (black) */
+ 		fb->fVigOn = false;                             /* presentMDP() stages VIG0 again when on */
+-		fb->fMDP[SWEET_MDP_CTL0_FLUSH / 4] = fb->fMDP[SWEET_MDP_CTL0_FLUSH / 4] | SWEET_FLUSH_VIG0 | SWEET_FLUSH_RGB0 |
+-		    SWEET_FLUSH_LM0 | SWEET_FLUSH_CTL;
++		fb->fMDP[SWEET_MDP_CTL0_FLUSH / 4] = fb->fMDP[SWEET_MDP_CTL0_FLUSH / 4] | SWEET_FLUSH_LM0 | SWEET_FLUSH_CTL;
+ 		IOLog("SWEET FB: display off: VIG0 off the mixer\n");
+ 	}
+ 	if (fb->fPowerOff) {
