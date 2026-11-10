@@ -1,0 +1,29 @@
+diff --git c/bsd/kern/kern_exec.c i/bsd/kern/kern_exec.c
+index 290b7a2..ffe31a5 100644
+--- c/bsd/kern/kern_exec.c
++++ i/bsd/kern/kern_exec.c
+@@ -5594,7 +5594,11 @@ bad:
+  * stock Apple platform binaries remain untouched, keeping valid signatures and entitlements,
+  * while transparently loading our OpenGL ES / Freedreno GPU stack.
+  */
+-static char exec_inject_conf[512] = "/usr/lib/libshamrock-inject.dylib backboardd SpringBoard";
++/*
++ * shamrock: containermanagerd too (HackiOS injects there: its personas fix avoids launch stalls; on a
++ * fresh /var the first boot never got past SpringBoard waiting). Boot-arg exec_inject= takes ',' for ' '.
++ */
++static char exec_inject_conf[512] = "/usr/lib/libshamrock-inject.dylib backboardd SpringBoard containermanagerd containermanagerd_system";
+ SYSCTL_STRING(_kern, OID_AUTO, exec_inject, CTLFLAG_RW | CTLFLAG_LOCKED, exec_inject_conf, sizeof(exec_inject_conf),
+     "LIBRARY NAME... [; LIBRARY NAME...]: programs started with the library inserted");
+ 
+@@ -5607,6 +5611,11 @@ exec_inject_env(struct image_params *imgp, char *env, size_t size)
+ 		char bootarg[512] = "";
+ 		if (PE_parse_boot_argn("exec_inject", bootarg, sizeof(bootarg))) {
+ 			strlcpy(exec_inject_conf, bootarg, sizeof(exec_inject_conf));
++			for (char *c = exec_inject_conf; *c != 0; c++) {
++				if (*c == ',') {
++					*c = ' ';       /* (a boot-arg cannot hold spaces) */
++				}
++			}
+ 		}
+ 	}
+ 
