@@ -1,0 +1,67 @@
+diff --git c/iokit/Kernel/arm/SweetFramebuffer.cpp i/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 7f48126..95602e4 100644
+--- c/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ i/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -66,6 +66,7 @@ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+  */
+ #define SWEET_MDP_TOP_PA        0x01a01000ULL   /* SMP_ALLOC_W 0x80, SMP_ALLOC_R 0x130 */
+ #define SWEET_MDP_VIG0_PA       0x01a05000ULL   /* MDP base + 0x4000 */
++#define SWEET_MDP_LM0_PA        0x01a45000ULL   /* MDP base + 0x44000: BORDER_COLOR_0 +0x08, _1 +0x10 */
+ #define SWEET_MDP_LAYER0        0x00            /* CTL0 */
+ #define SWEET_FLUSH_VIG0        (1u << 0)
+ #define SWEET_FLUSH_RGB0        (1u << 3)
+@@ -149,6 +150,7 @@ public:
+ 	volatile uint32_t *fRGB0;
+ 	IOMemoryMap  *fBuf1Map;
+ 	volatile uint32_t *fTop;        /* MDP top (SMP); NULL: no VIG0 scanout */
++	volatile uint32_t *fLM0;        /* shamrock: layer mixer 0 (border colour), may be NULL */
+ 	volatile uint32_t *fVIG0;
+ 	bool          fVigSetUp, fVigOn;
+ 	SweetSurface *fScanned[2];      /* [0] shown by VIG0 now, [1] flushed to be shown next */
+@@ -286,6 +288,7 @@ AppleCLCD::start(IOService *provider)
+ 			if (vig) {
+ 				fTop = (volatile uint32_t *)ml_io_map((vm_offset_t)SWEET_MDP_TOP_PA, 0x1000);
+ 				fVIG0 = (volatile uint32_t *)ml_io_map((vm_offset_t)SWEET_MDP_VIG0_PA, 0x1000);
++				fLM0 = (volatile uint32_t *)ml_io_map((vm_offset_t)SWEET_MDP_LM0_PA, 0x1000);
+ 				if (fTop == NULL || fVIG0 == NULL) {
+ 					fTop = NULL;
+ 					fVIG0 = NULL;
+@@ -340,6 +343,10 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	if (fb->fPowerOff && fb->fVigOn && fb->fMDP != NULL) {
+ 		/* shamrock: the panel shows VIG0's surface, not fPixels: fading fPixels froze the last frame on screen */
++		if (fb->fLM0 != NULL) {
++			fb->fLM0[0x08 / 4] = 0;                 /* LM0 BORDER_COLOR_0/1: black (lk2nd leaves blue) */
++			fb->fLM0[0x10 / 4] = 0;
++		}
+ 		fb->fMDP[SWEET_MDP_LAYER0 / 4] = 0;             /* no pipe on the mixer: border colour (black) */
+ 		fb->fVigOn = false;                             /* presentMDP() stages VIG0 again when on */
+ 		fb->fMDP[SWEET_MDP_CTL0_FLUSH / 4] = fb->fMDP[SWEET_MDP_CTL0_FLUSH / 4] | SWEET_FLUSH_VIG0 | SWEET_FLUSH_RGB0 |
+@@ -372,18 +379,20 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	 * (the frame stays dirty for the next one), nothing waits.
+ 	 */
+ 	if (flush && fb->fMDP != NULL && (fb->fMDP[SWEET_MDP_CTL0_FLUSH / 4] & SWEET_FLUSH_ALL) != 0) {
+-		if (++fb->fBusyRun <= 3) {
+-			flush = false;
+-			fb->fFlipBusy++;
+-		} else {
+-			fb->fBusyForced++;              /* pending for 3 ticks: the flush bit did not clear; go on anyway */
+-			fb->fBusyRun = 0;
++		/*
++		 * Never push a flip through while one is pending (r63: forcing it after 3 ticks let backboardd
++		 * draw into the surface VIG0 still scanned out: large blocks of half-drawn frames flickered).
++		 */
++		flush = false;
++		fb->fFlipBusy++;
++		if (++fb->fBusyRun > fb->fBusyForced) {
++			fb->fBusyForced = fb->fBusyRun;         /* (now: the longest run of pending ticks) */
+ 		}
+ 	} else if (flush) {
+ 		fb->fBusyRun = 0;
+ 	}
+ 	if ((++fb->fStatTicks % (5000000 / SWEET_FB_VSYNC_US)) == 0) {
+-		IOLog("SWEET FB: 5 s: %llu swaps in all, %u VIG0 / %u CPU frames, %u ticks skipped, %u forced, flush %#x, "
++		IOLog("SWEET FB: 5 s: %llu swaps in all, %u VIG0 / %u CPU frames, %u ticks skipped (longest run %u), flush %#x, "
+ 		    "layer0 %#x, dirty %d, off %d, vig %d\n", fb->fStatSwaps, fb->fVigFrames, fb->fCpuFrames, fb->fFlipBusy,
+ 		    fb->fBusyForced, fb->fMDP ? fb->fMDP[SWEET_MDP_CTL0_FLUSH / 4] : 0, fb->fMDP ? fb->fMDP[SWEET_MDP_LAYER0 / 4] : 0,
+ 		    fb->fDirty, fb->fPowerOff, fb->fVigOn);
