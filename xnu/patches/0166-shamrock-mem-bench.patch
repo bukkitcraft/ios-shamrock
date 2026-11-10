@@ -1,0 +1,71 @@
+diff --git c/osfmk/arm64/sweet_stall.c i/osfmk/arm64/sweet_stall.c
+index 76caa6b..9c68d2b 100644
+--- c/osfmk/arm64/sweet_stall.c
++++ i/osfmk/arm64/sweet_stall.c
+@@ -21,6 +21,7 @@
+ #include <kern/task.h>
+ #include <string.h>
+ #include <vm/vm_map.h>
++#include <vm/vm_kern.h>
+ 
+ #if defined(SWEET)
+ extern int printf(const char *fmt, ...) __printflike(1, 2);
+@@ -358,6 +359,50 @@ sweet_cpu_bench(void)
+ 	printf("SWEET BENCH: 20000000 loop iterations in %llu us (~%llu iterations/us)\n", us, us ? 20000000ULL / us : 0);
+ }
+ 
++/*
++ * shamrock: memory bandwidth at boot (is the DDR left slow by the boot chain? sysmem GPU rendering is
++ * bandwidth bound). 16 MiB buffers, well beyond the 1 MiB L2: read (64-bit loads summed), write
++ * (stores), copy (memcpy). MB/s = bytes / microseconds.
++ */
++static void
++sweet_mem_bench(void)
++{
++	const vm_size_t size = 16 << 20;
++	vm_offset_t a = 0, b = 0;
++	if (kmem_alloc(kernel_map, &a, size, KMA_DATA, VM_KERN_MEMORY_DIAG) != KERN_SUCCESS ||
++	    kmem_alloc(kernel_map, &b, size, KMA_DATA, VM_KERN_MEMORY_DIAG) != KERN_SUCCESS) {
++		printf("SWEET MEMBENCH: no memory\n");
++		return;
++	}
++	memset((void *)a, 1, size);
++	memset((void *)b, 2, size);
++	uint64_t t0, us, sum = 0;
++	volatile uint64_t *p = (volatile uint64_t *)a;
++	t0 = mach_absolute_time();
++	for (int r = 0; r < 4; r++) {
++		for (vm_size_t i = 0; i < size / 8; i += 4) {
++			sum += p[i] + p[i + 1] + p[i + 2] + p[i + 3];
++		}
++	}
++	us = (mach_absolute_time() - t0) * 10ULL / 192ULL;
++	uint64_t rd = us ? (4ULL * size) / us : 0;
++	t0 = mach_absolute_time();
++	for (int r = 0; r < 4; r++) {
++		memset((void *)b, r, size);
++	}
++	us = (mach_absolute_time() - t0) * 10ULL / 192ULL;
++	uint64_t wr = us ? (4ULL * size) / us : 0;
++	t0 = mach_absolute_time();
++	for (int r = 0; r < 4; r++) {
++		memcpy((void *)b, (void *)a, size);
++	}
++	us = (mach_absolute_time() - t0) * 10ULL / 192ULL;
++	uint64_t cp = us ? (4ULL * size) / us : 0;
++	printf("SWEET MEMBENCH: read %llu MB/s, write %llu MB/s, copy %llu MB/s (16 MiB x4; sum %llx)\n", rd, wr, cp, sum & 0xff);
++	kmem_free(kernel_map, a, size);
++	kmem_free(kernel_map, b, size);
++}
++
+ void sweet_stall_arm(uint32_t seconds);
+ void
+ sweet_stall_arm(uint32_t seconds)
+@@ -366,6 +411,7 @@ sweet_stall_arm(uint32_t seconds)
+ 	if (!benched) {
+ 		benched = true;
+ 		sweet_cpu_bench();
++		sweet_mem_bench();
+ 	}
+ 	static thread_call_t call;
+ 	uint64_t deadline;
