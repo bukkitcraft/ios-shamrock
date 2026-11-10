@@ -1,0 +1,353 @@
+diff --git c/bsd/conf/files i/bsd/conf/files
+index 65caf83..67c29a1 100644
+--- c/bsd/conf/files
++++ i/bsd/conf/files
+@@ -110,6 +110,7 @@ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/shamrock_keys.c			standard
++bsd/dev/shamrock_rpm.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git c/bsd/dev/shamrock_rpm.c i/bsd/dev/shamrock_rpm.c
+new file mode 100644
+index 0000000..021ac2a
+--- /dev/null
++++ i/bsd/dev/shamrock_rpm.c
+@@ -0,0 +1,280 @@
++/*
++ * shamrock: minimal RPM client (MSM8952) over the SMD "rpm_requests" channel in SMEM.
++ *
++ * Nothing in this kernel talks to the RPM (the resource power manager), so the DDR (BIMC) clock and
++ * the VDD_CX level stay wherever the boot chain left them; sysmem GPU rendering is bandwidth bound
++ * and the A405 at 550 MHz needs VDD_CX turbo. Same protocol as Linux's qcom_smd.c + qcom_smd_rpm.c,
++ * polled: the channel is found in the SMEM channel allocation table, opened (lk2nd closes it when it
++ * hands over), a request ('req', msg id, set, resource type and id, key/value pairs) is written to
++ * the TX FIFO as one packet (20-byte SMD packet header), the RPM is rung through the APCS IPC
++ * register, and the answer is read back from the RX FIFO.
++ *
++ * Boot-arg sweetrpm: 0 off (default), 1 find and log the channel only, 2 also vote the DDR clock up
++ * (sweetrpm_bimc=<kHz>, default 931200) and log the memory bandwidth after it.
++ * Stock DT (MSM8952_Shamrock.dts): smem 0x86300000 + 1 MiB, irq-reg-base 0x0b011008, rpm edge 15,
++ * irq bitmask 0x1; RPM_MEM_CLK_TYPE 'clk2' BIMC id 0 (key "KHz"); VDD_CX = smpa 2 ("vlvl", 384 turbo).
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <machine/machine_routines.h>
++#include <string.h>
++
++#define SMEM_PA                 0x86300000ULL
++#define SMEM_SIZE               0x100000
++#define RPM_IPC_PA              0x0b011008ULL           /* APCS IPC; bit 0: RPM */
++#define SMEM_TOC                0xcc                    /* smem_header.toc[] */
++#define SMEM_ITEMS              512
++
++#define SMD_EDGE_RPM            15
++#define SMD_PACKET_HEADER       20
++
++enum { SMD_CLOSED = 0, SMD_OPENING = 1, SMD_OPENED = 2 };
++
++/* channel info, byte flags (smd_channel_info) and word flags (smd_channel_info_word) */
++struct smd_info_b {
++	uint32_t state;
++	uint8_t  fDSR, fCTS, fCD, fRI, fHEAD, fTAIL, fSTATE, fBLOCKREADINTR;
++	uint32_t tail, head;
++};
++struct smd_info_w {
++	uint32_t state, fDSR, fCTS, fCD, fRI, fHEAD, fTAIL, fSTATE, fBLOCKREADINTR;
++	uint32_t tail, head;
++};
++
++static volatile uint8_t *smem;
++static volatile uint32_t *ipc;
++static volatile void *tx_info, *rx_info;
++static bool word_info;
++static volatile uint8_t *tx_fifo, *rx_fifo;
++static uint32_t fifo_size, msg_id;
++
++extern void sweet_mem_bench_print(const char *when);
++
++static volatile void *
++smem_item(uint32_t item, uint32_t *size)
++{
++	if (item >= SMEM_ITEMS) {
++		return NULL;
++	}
++	volatile uint32_t *e = (volatile uint32_t *)(smem + SMEM_TOC + 16 * item);
++	if (e[0] != 1 || (e[3] & ~3u) != 0 || e[1] + e[2] > SMEM_SIZE) {      /* allocated, in the main region */
++		return NULL;
++	}
++	if (size) {
++		*size = e[2];
++	}
++	return smem + e[1];
++}
++
++#define INFO_GET(p, f)      (word_info ? ((volatile struct smd_info_w *)(p))->f : ((volatile struct smd_info_b *)(p))->f)
++#define INFO_SET(p, f, v)   do { if (word_info) ((volatile struct smd_info_w *)(p))->f = (v); \
++	                         else ((volatile struct smd_info_b *)(p))->f = (v); } while (0)
++
++static void
++rpm_kick(void)
++{
++	__builtin_arm_dmb(0xf);
++	*ipc = 1;
++	__builtin_arm_dsb(0xf);
++}
++
++static bool
++rpm_find(void)
++{
++	static const uint32_t tbl[2][3] = { { 13, 14, 338 }, { 266, 138, 202 } };
++	for (int t = 0; t < 2; t++) {
++		uint32_t size = 0;
++		volatile uint8_t *alloc = (volatile uint8_t *)smem_item(tbl[t][0], &size);
++		if (alloc == NULL) {
++			continue;
++		}
++		for (uint32_t i = 0; i < size / 32 && i < 64; i++) {
++			volatile uint8_t *ent = alloc + 32 * i;
++			char name[21];
++			for (int k = 0; k < 20; k++) {
++				name[k] = (char)ent[k];
++			}
++			name[20] = 0;
++			uint32_t cid = *(volatile uint32_t *)(ent + 20), flags = *(volatile uint32_t *)(ent + 24);
++			uint32_t refs = *(volatile uint32_t *)(ent + 28);
++			if (name[0] == 0 || refs == 0) {
++				continue;
++			}
++			if ((flags & 0xff) == SMD_EDGE_RPM) {
++				printf("SHAMROCK RPM: table %d channel %u '%s' flags %#x\n", t, cid, name, flags);
++			}
++			if ((flags & 0xff) != SMD_EDGE_RPM || strcmp(name, "rpm_requests") != 0) {
++				continue;
++			}
++			uint32_t isz = 0, fsz = 0;
++			volatile uint8_t *info = (volatile uint8_t *)smem_item(tbl[t][1] + cid, &isz);
++			volatile uint8_t *fifo = (volatile uint8_t *)smem_item(tbl[t][2] + cid, &fsz);
++			if (info == NULL || fifo == NULL) {
++				printf("SHAMROCK RPM: channel %u: info %p (%u) fifo %p (%u)\n", cid, info, isz, fifo, fsz);
++				return false;
++			}
++			word_info = isz >= 2 * sizeof(struct smd_info_w);
++			tx_info = info;
++			rx_info = info + (word_info ? sizeof(struct smd_info_w) : sizeof(struct smd_info_b));
++			fifo_size = fsz / 2;
++			tx_fifo = fifo;
++			rx_fifo = fifo + fifo_size;
++			printf("SHAMROCK RPM: rpm_requests cid %u, %s flags, fifos 2 x %u; tx state %u head %u tail %u, "
++			    "rx state %u head %u tail %u\n", cid, word_info ? "word" : "byte", fifo_size,
++			    INFO_GET(tx_info, state), INFO_GET(tx_info, head), INFO_GET(tx_info, tail),
++			    INFO_GET(rx_info, state), INFO_GET(rx_info, head), INFO_GET(rx_info, tail));
++			return true;
++		}
++	}
++	printf("SHAMROCK RPM: no rpm_requests channel in SMEM\n");
++	return false;
++}
++
++static bool
++rpm_wait_rx_state(uint32_t want, uint32_t ms)
++{
++	uint64_t t0 = mach_absolute_time(), d;
++	nanoseconds_to_absolutetime((uint64_t)ms * NSEC_PER_MSEC, &d);
++	while (INFO_GET(rx_info, state) != want) {
++		if (mach_absolute_time() - t0 > d) {
++			return false;
++		}
++	}
++	return true;
++}
++
++static bool
++rpm_open(void)
++{
++	if (INFO_GET(tx_info, state) == SMD_OPENED && INFO_GET(rx_info, state) == SMD_OPENED) {
++		return true;
++	}
++	/* qcom_smd_channel_reset + open: our head and the remote's tail to 0, then OPENING */
++	INFO_SET(tx_info, state, SMD_CLOSED);
++	INFO_SET(tx_info, fDSR, 0);
++	INFO_SET(tx_info, fCTS, 0);
++	INFO_SET(tx_info, fCD, 0);
++	INFO_SET(tx_info, fSTATE, 1);
++	INFO_SET(tx_info, head, 0);
++	INFO_SET(rx_info, tail, 0);
++	rpm_kick();
++	INFO_SET(tx_info, fDSR, 1);
++	INFO_SET(tx_info, fCTS, 1);
++	INFO_SET(tx_info, fCD, 1);
++	INFO_SET(tx_info, state, SMD_OPENING);
++	INFO_SET(tx_info, fSTATE, 1);
++	rpm_kick();
++	if (!rpm_wait_rx_state(SMD_OPENED, 500)) {
++		printf("SHAMROCK RPM: remote did not open (rx state %u)\n", INFO_GET(rx_info, state));
++		return false;
++	}
++	INFO_SET(tx_info, state, SMD_OPENED);
++	INFO_SET(tx_info, fSTATE, 1);
++	rpm_kick();
++	return true;
++}
++
++static void
++fifo_write(const void *data, uint32_t len)
++{
++	uint32_t head = INFO_GET(tx_info, head);
++	const uint8_t *p = (const uint8_t *)data;
++	for (uint32_t i = 0; i < len; i++) {
++		tx_fifo[head] = p[i];
++		head = (head + 1) % fifo_size;
++	}
++	__builtin_arm_dmb(0xf);
++	INFO_SET(tx_info, head, head);
++}
++
++/* one request: type, id, key/value pairs (count pairs). Returns true if the RPM answered. */
++static bool
++rpm_request(uint32_t type, uint32_t id, const uint32_t *kv, uint32_t pairs)
++{
++	uint32_t pkt[5 + 2 + 5 + 3 * 4];
++	uint32_t data = 12 * pairs, body = 2 * 4 + 5 * 4 + data;
++	if (pairs > 4) {
++		return false;
++	}
++	uint32_t w = 0;
++	pkt[w++] = body;                        /* SMD packet header: length, then 4 zero words */
++	pkt[w++] = 0; pkt[w++] = 0; pkt[w++] = 0; pkt[w++] = 0;
++	pkt[w++] = 0x00716572;                  /* 'req' */
++	pkt[w++] = 5 * 4 + data;
++	pkt[w++] = ++msg_id;
++	pkt[w++] = 0;                           /* active set */
++	pkt[w++] = type;
++	pkt[w++] = id;
++	pkt[w++] = data;
++	for (uint32_t i = 0; i < pairs; i++) {
++		pkt[w++] = kv[2 * i];
++		pkt[w++] = 4;
++		pkt[w++] = kv[2 * i + 1];
++	}
++	uint32_t len = 4 * w;
++	uint32_t head = INFO_GET(tx_info, head), tail = INFO_GET(tx_info, tail);
++	uint32_t free_bytes = fifo_size - ((head - tail + fifo_size) % fifo_size) - 1;
++	if (len > free_bytes) {
++		printf("SHAMROCK RPM: tx fifo full (head %u tail %u)\n", head, tail);
++		return false;
++	}
++	uint32_t rx_head0 = INFO_GET(rx_info, head);
++	fifo_write(pkt, len);
++	INFO_SET(tx_info, fHEAD, 1);
++	rpm_kick();
++
++	/* the answer: a packet in the RX FIFO; consume it (tail = head) and tell the RPM */
++	uint64_t t0 = mach_absolute_time(), d;
++	nanoseconds_to_absolutetime(200 * NSEC_PER_MSEC, &d);
++	while (INFO_GET(rx_info, head) == rx_head0) {
++		if (mach_absolute_time() - t0 > d) {
++			printf("SHAMROCK RPM: request %u (type %#x id %u): no answer\n", msg_id, type, id);
++			return false;
++		}
++	}
++	uint32_t rt = INFO_GET(rx_info, tail), rh = INFO_GET(rx_info, head);
++	uint32_t word[8] = { 0 };
++	for (uint32_t i = 0; i < 32 && ((rt + i) % fifo_size) != rh; i++) {
++		((uint8_t *)word)[i] = rx_fifo[(rt + i) % fifo_size];
++	}
++	INFO_SET(rx_info, tail, rh);
++	INFO_SET(tx_info, fTAIL, 1);
++	rpm_kick();
++	printf("SHAMROCK RPM: request %u (type %#x id %u): answer %08x %08x %08x %08x %08x %08x %08x %08x\n", msg_id,
++	    type, id, word[0], word[1], word[2], word[3], word[4], word[5], word[6], word[7]);
++	return true;
++}
++
++void shamrock_rpm_init(void);
++void
++shamrock_rpm_init(void)
++{
++	uint32_t mode = 0, bimc = 931200;
++	PE_parse_boot_argn("sweetrpm", &mode, sizeof(mode));
++	PE_parse_boot_argn("sweetrpm_bimc", &bimc, sizeof(bimc));
++	if (mode == 0) {
++		return;
++	}
++	smem = (volatile uint8_t *)ml_io_map(SMEM_PA, SMEM_SIZE);
++	ipc = (volatile uint32_t *)ml_io_map(RPM_IPC_PA & ~0xfffULL, 0x1000);
++	if (smem == NULL || ipc == NULL) {
++		printf("SHAMROCK RPM: cannot map SMEM / IPC\n");
++		return;
++	}
++	ipc = (volatile uint32_t *)((volatile uint8_t *)ipc + (RPM_IPC_PA & 0xfff));
++	volatile uint32_t *hdr = (volatile uint32_t *)smem;
++	printf("SHAMROCK RPM: SMEM initialized %u available %u free %#x version[7] %#x\n", hdr[0xc0 / 4], hdr[0xc4 / 4],
++	    hdr[0xc8 / 4], hdr[0x40 / 4 + 7]);
++	if (!rpm_find() || mode < 2) {
++		return;
++	}
++	if (!rpm_open()) {
++		return;
++	}
++	uint32_t kv[2] = { 0x007A484B, bimc };          /* "KHz" */
++	if (rpm_request(0x326b6c63, 0, kv, 1)) {        /* 'clk2' BIMC */
++		sweet_mem_bench_print("after the BIMC vote");
++	}
++}
+diff --git c/iokit/Kernel/arm/SweetPlatformExpert.cpp i/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index d57aa56..f194ca0 100644
+--- c/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ i/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -12,6 +12,7 @@
+ 
+ extern "C" void sweet_stall_arm(uint32_t seconds);
+ extern "C" void sweet_wdt_reset(void);
++extern "C" void shamrock_rpm_init(void);
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -40,6 +41,7 @@ SweetPlatformExpert::start(IOService *provider)
+ 		uint32_t stall = 0;
+ 		(void)PE_parse_boot_argn("sweetstall", &stall, sizeof(stall));
+ 		sweet_stall_arm(stall);         /* also starts the live log (sweetlivelog=0: off) */
++		shamrock_rpm_init();            /* boot-arg sweetrpm (off by default) */
+ 	}
+ 	return true;
+ }
+diff --git c/osfmk/arm64/sweet_stall.c i/osfmk/arm64/sweet_stall.c
+index 9c68d2b..8cd77fa 100644
+--- c/osfmk/arm64/sweet_stall.c
++++ i/osfmk/arm64/sweet_stall.c
+@@ -364,8 +364,9 @@ sweet_cpu_bench(void)
+  * bandwidth bound). 16 MiB buffers, well beyond the 1 MiB L2: read (64-bit loads summed), write
+  * (stores), copy (memcpy). MB/s = bytes / microseconds.
+  */
+-static void
+-sweet_mem_bench(void)
++void sweet_mem_bench_print(const char *when);
++void
++sweet_mem_bench_print(const char *when)
+ {
+ 	const vm_size_t size = 16 << 20;
+ 	vm_offset_t a = 0, b = 0;
+@@ -398,7 +399,8 @@ sweet_mem_bench(void)
+ 	}
+ 	us = (mach_absolute_time() - t0) * 10ULL / 192ULL;
+ 	uint64_t cp = us ? (4ULL * size) / us : 0;
+-	printf("SWEET MEMBENCH: read %llu MB/s, write %llu MB/s, copy %llu MB/s (16 MiB x4; sum %llx)\n", rd, wr, cp, sum & 0xff);
++	printf("SWEET MEMBENCH (%s): read %llu MB/s, write %llu MB/s, copy %llu MB/s (16 MiB x4; sum %llx)\n", when, rd, wr, cp,
++	    sum & 0xff);
+ 	kmem_free(kernel_map, a, size);
+ 	kmem_free(kernel_map, b, size);
+ }
+@@ -411,7 +413,7 @@ sweet_stall_arm(uint32_t seconds)
+ 	if (!benched) {
+ 		benched = true;
+ 		sweet_cpu_bench();
+-		sweet_mem_bench();
++		sweet_mem_bench_print("boot");
+ 	}
+ 	static thread_call_t call;
+ 	uint64_t deadline;
