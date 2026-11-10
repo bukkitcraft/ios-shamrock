@@ -1,0 +1,118 @@
+diff --git c/bsd/dev/shamrock_rpm.c i/bsd/dev/shamrock_rpm.c
+index 373abcd..7aa45d8 100644
+--- c/bsd/dev/shamrock_rpm.c
++++ i/bsd/dev/shamrock_rpm.c
+@@ -48,6 +48,7 @@ struct smd_info_w {
+ };
+ 
+ static volatile uint8_t *smem, *smem_aux;
++static bool rpm_ready;
+ static volatile uint32_t *ipc;
+ static volatile void *tx_info, *rx_info;
+ static bool word_info;
+@@ -297,9 +298,19 @@ shamrock_rpm_init(void)
+ 	if (!rpm_open()) {
+ 		return;
+ 	}
++	rpm_ready = true;
+ 	uint32_t kv[2] = { 0x007A484B, bimc };          /* "KHz" */
+ 	if (rpm_request(0x326b6c63, 0, kv, 1)) {        /* 'clk2' BIMC */
+ 		sweet_mem_bench_print("after the BIMC vote");
+ 		STEP("SHAMROCK RPM: BIMC %u kHz voted, still running\n", bimc);
+ 	}
+ }
++
++/* shamrock: one active-set vote (key = value) from other drivers once the channel is open (sweetrpm=2) */
++bool shamrock_rpm_vote(uint32_t type, uint32_t id, uint32_t key, uint32_t value);
++bool
++shamrock_rpm_vote(uint32_t type, uint32_t id, uint32_t key, uint32_t value)
++{
++	uint32_t kv[2] = { key, value };
++	return rpm_ready && rpm_request(type, id, kv, 1);
++}
+diff --git c/iokit/Kernel/arm/SweetAdreno.cpp i/iokit/Kernel/arm/SweetAdreno.cpp
+index 551f7c1..bb209a7 100644
+--- c/iokit/Kernel/arm/SweetAdreno.cpp
++++ i/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -92,6 +92,65 @@ static inline uint32_t gcc_read(uint32_t reg)
+ 	return g_gcc[reg >> 2];
+ }
+ 
++/*
++ * shamrock: A405 at 550 MHz (stock gpu-pwrlevel@0). gfx3d is on VDD_CX, which needs the HIGH (turbo)
++ * level at 550 MHz (clock-gcc-8952.c VDD_DIG_FMAX_MAP5): vote smpa2 to level 384 through the RPM first
++ * (shamrock_rpm.c), then bring GPLL3 up like Linux's alpha PLL code (clock-alpha-pll.c, gpll3_clk_src):
++ * VCO 1100 MHz = 19.2 MHz x (57 + 0x4AAAAAAA / 2^32), fused post divider 2 -> 550 MHz.
++ * GPLL3 at 0x22000: MODE +0 (OUTCTRL 1, BYPASSNL 2, RESET_N 4, LOCK bit 31), L +4, ALPHA +8 (40 bits),
++ * USER_CTL +0x10 (main output bit 0, post div [11:8], alpha enable bit 24, vco [21:20]), CONFIG_CTL +0x18,
++ * TEST_CTL_HI +0x20.
++ */
++extern "C" bool shamrock_rpm_vote(uint32_t type, uint32_t id, uint32_t key, uint32_t value);
++#define GPLL3_BASE 0x22000
++static bool
++gpll3_550(void)
++{
++	if (!shamrock_rpm_vote(0x61706d73 /* 'smpa' */, 2, 0x6C766C76 /* 'vlvl' */, 384)) {
++		IOLog("SWEET A405: no VDD_CX turbo vote (sweetrpm=2 needed): staying at 400 MHz\n");
++		return false;
++	}
++	delay(200);
++	uint32_t mode = gcc_read(GPLL3_BASE);
++	if (mode & 0x7u) {
++		gcc_write(GPLL3_BASE, mode & ~0x7u);
++		delay(5);
++	}
++	gcc_write(GPLL3_BASE + 0x04, 57);
++	gcc_write(GPLL3_BASE + 0x08, 0xAAAAAA00u);
++	gcc_write(GPLL3_BASE + 0x0c, 0x4Au);
++	uint32_t user = gcc_read(GPLL3_BASE + 0x10);
++	user &= ~((0xfu << 8) | (3u << 20) | 0xfu);
++	user |= (1u << 8) | (1u << 24) | 1u;
++	gcc_write(GPLL3_BASE + 0x10, user);
++	gcc_write(GPLL3_BASE + 0x18, 0x4001055bu);
++	gcc_write(GPLL3_BASE + 0x20, 0x40000600u);
++	__builtin_arm_dsb(0xf);
++	mode = gcc_read(GPLL3_BASE) | 0x2u;            /* BYPASSNL */
++	gcc_write(GPLL3_BASE, mode);
++	delay(10);
++	mode |= 0x4u;                                   /* RESET_N */
++	gcc_write(GPLL3_BASE, mode);
++	bool locked = false;
++	for (int i = 0; i < 1000; i++) {
++		if (gcc_read(GPLL3_BASE) & (1u << 31)) {
++			locked = true;
++			break;
++		}
++		delay(10);
++	}
++	if (!locked) {
++		IOLog("SWEET A405: GPLL3 did not lock (mode %#x): staying at 400 MHz\n", gcc_read(GPLL3_BASE));
++		gcc_write(GPLL3_BASE, 0);
++		return false;
++	}
++	gcc_write(GPLL3_BASE, mode | 0x1u);             /* OUTCTRL */
++	__builtin_arm_dsb(0xf);
++	IOLog("SWEET A405: GPLL3 locked: mode %#x L %u user %#x\n", gcc_read(GPLL3_BASE), gcc_read(GPLL3_BASE + 4),
++	    gcc_read(GPLL3_BASE + 0x10));
++	return true;
++}
++
+ static void ring_out(uint32_t val)
+ {
+ 	g_ring[g_ring_wptr] = val;
+@@ -143,7 +202,14 @@ static bool power_on_oxili(void)
+ 	 *    Divider: 2 (400 MHz safe operating frequency, 2*div - 1 = 3 -> bits 4:0 = 3)
+ 	 *    CFG = (1 << 8) | 3 = 0x00000103.
+ 	 */
+-	gcc_write(GFX3D_CLK_SRC_CFG, (1u << 8) | 3u);
++	uint32_t gfx3d_cfg = (1u << 8) | 3u;
++	uint32_t mhz = 400;
++	PE_parse_boot_argn("sweetgpu_mhz", &mhz, sizeof(mhz));
++	if (mhz >= 550 && gpll3_550()) {
++		gfx3d_cfg = (2u << 8) | 1u;     /* GPLL3 (550 MHz after its fused /2), RCG /1 */
++	}
++	IOLog("SWEET A405: GPU clock %s\n", gfx3d_cfg == ((1u << 8) | 3u) ? "400 MHz (GPLL0 / 2)" : "550 MHz (GPLL3)");
++	gcc_write(GFX3D_CLK_SRC_CFG, gfx3d_cfg);
+ 	gcc_write(GFX3D_CLK_SRC_CMD, 1u);
+ 	for (int i = 0; i < 2000; i++) {
+ 		if (!(gcc_read(GFX3D_CLK_SRC_CMD) & 1u)) {
